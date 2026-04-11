@@ -289,11 +289,12 @@ def parse_theatre_json(json_data: str | list | dict, source_name: str = "") -> l
     return events
 
 
-def normalize_location_name(location: str) -> str:
+def normalize_location_name(location: str, scene: str | None = None) -> str:
     """Normalize location name to match database format.
     
     Args:
         location: Raw location name from source
+        scene: Optional scene name for venue disambiguation
     
     Returns:
         Normalized location name matching database
@@ -302,11 +303,20 @@ def normalize_location_name(location: str) -> str:
         return ""
     
     normalized = location.strip().lower()
+    scene_name = (scene or "").strip()
+
+    def _with_tretyakov_scene(value: str) -> str:
+        if value == TRETYAKOV_LOCATION and scene_name:
+            return f"{TRETYAKOV_LOCATION} ({scene_name})"
+        return value
     
     # Direct mapping lookup
     for key, value in LOCATION_MAPPINGS.items():
         if key in normalized:
-            return value
+            return _with_tretyakov_scene(value)
+
+    if normalized == TRETYAKOV_LOCATION.lower():
+        return _with_tretyakov_scene(TRETYAKOV_LOCATION)
     
     # Return original if no mapping found
     return location.strip()
@@ -380,10 +390,10 @@ async def find_existing_event(
     Returns:
         Tuple of (event_id, needs_full_update):
         - event_id: ID of existing event or None if not found
-        - needs_full_update: True if event has 00:00 time and should be fully updated
+        - needs_full_update: True if event has placeholder time (00:00/empty) and should be fully updated
     """
     from models import Event
-    from sqlalchemy import select
+    from sqlalchemy import select, or_
     from difflib import SequenceMatcher
     
     logger.debug(
@@ -411,10 +421,10 @@ async def find_existing_event(
             new_loc = (location_name or "").strip().lower()
             ev_addr = (ev.location_address or "").strip().lower()
             
-            # Exact location match
-            if ev_loc == new_loc:
+            # Exact location match requires title similarity
+            if ev_loc == new_loc and fuzzy_title_match(title, ev.title):
                 logger.info(
-                    "find_existing_event: MATCHED by location event_id=%d title=%s",
+                    "find_existing_event: MATCHED by location+title event_id=%d title=%s",
                     ev.id, ev.title[:50],
                 )
                 return ev.id, False
@@ -443,7 +453,7 @@ async def find_existing_event(
         if event_time != "00:00":
             stmt_placeholder = select(Event).where(
                 Event.date == event_date,
-                Event.time == "00:00",
+                or_(Event.time == "00:00", Event.time == ""),
             )
             result = await session.execute(stmt_placeholder)
             placeholders = result.scalars().all()
@@ -471,7 +481,7 @@ async def find_existing_event(
         for ev in loc_candidates:
             if fuzzy_title_match(title, ev.title):
                 # Different time for same event?
-                if ev.time == "00:00" and event_time != "00:00":
+                if (ev.time or "") in {"", "00:00"} and event_time != "00:00":
                     logger.info(
                         "find_existing_event: MATCHED by loc+title placeholder event_id=%d",
                         ev.id,

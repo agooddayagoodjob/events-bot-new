@@ -29,6 +29,13 @@ RUBRIC_MARKERS = [
     "\u200b", # Invisible marker for split daily posts
 ]
 
+# Hashtags that TRIGGER button addition (EVE-13)
+# Buttons should ONLY be added if one of these tags is present.
+BUTTON_TRIGGER_HASHTAGS = [
+    "#анонс",
+    "#анонскалининград", 
+]
+
 # Regex to find hashtags
 HASHTAG_RE = re.compile(r"#\w+")
 
@@ -55,22 +62,28 @@ async def get_month_page_url(db: Database, target_date: date) -> str | None:
             return page.url
     return None
 
-async def get_tomorrow_page_url(db: Database, target_date: date) -> str | None:
-    """Get or create URL for tomorrow's special page."""
+async def get_tomorrow_page_url(db: Database, target_date: date, force_regenerate: bool = False) -> str | None:
+    """Get or create URL for tomorrow's special page.
+    
+    Args:
+        db: Database instance
+        target_date: Date to generate page for
+        force_regenerate: If True, always create new page and update DB cache
+    """
     date_str = target_date.isoformat()
     
-    async with db.get_session() as session:
-        # Check cache
-        cached = await session.get(TomorrowPage, date_str)
-        if cached:
-            return cached.url
+    if not force_regenerate:
+        async with db.get_session() as session:
+            # Check cache
+            cached = await session.get(TomorrowPage, date_str)
+            if cached:
+                return cached.url
             
     # Generate new page
-    # Note: create_special_telegraph_page manages its own db session usually, 
-    # but looking at signature it takes 'db'.
-    # We need to ensure we don't have transaction conflicts if we reuse session?
-    # The signature in special_pages.py is: async def create_special_telegraph_page(db: "Database", ...)
-    # So we pass the db instance.
+    # Format title like weekend pages: "20 января — афиша"
+    day = target_date.day
+    month_name = MONTH_NAMES_GENITIVE[target_date.month]
+    formatted_title = f"{day} {month_name} — афиша"
     
     try:
         url, _ = await create_special_telegraph_page(
@@ -78,14 +91,20 @@ async def get_tomorrow_page_url(db: Database, target_date: date) -> str | None:
             start_date=target_date,
             days=1,
             cover_url=None, # No cover for auto-generated daily tomorrow page
-            title="Афиша на завтра"
+            title=formatted_title
         )
         
         if url:
-            # Cache it
+            # Update or create cache entry
             async with db.get_session() as session:
-                entry = TomorrowPage(date=date_str, url=url)
-                session.add(entry)
+                existing = await session.get(TomorrowPage, date_str)
+                if existing:
+                    existing.url = url
+                    logger.info("Updated TomorrowPage cache for %s: %s", date_str, url)
+                else:
+                    entry = TomorrowPage(date=date_str, url=url)
+                    session.add(entry)
+                    logger.info("Created TomorrowPage cache for %s: %s", date_str, url)
                 await session.commit()
             return url
             
@@ -107,25 +126,35 @@ def format_date_range(start: date, end: date) -> str:
     return f"{format_short_date(start)}-{format_short_date(end)}"
 
 async def get_weekend_page_data(db: Database, target_date: date) -> tuple[str | None, date | None]:
-    """Get URL and Friday date for weekend page."""
-    # Logic: Find Friday of the week
-    weekday = target_date.weekday() # 0=Mon, 6=Sun
+    """Get URL and Saturday date for weekend page.
     
-    if weekday <= 2:
-        friday = target_date + timedelta(days=(4 - weekday))
-    else:
-        friday = target_date - timedelta(days=(weekday - 4))
-        
-    start_str = friday.isoformat()
+    WeekendPage is keyed by Saturday's date (the first day of the weekend).
+    """
+    # Calculate Saturday for this weekend
+    weekday = target_date.weekday()  # 0=Mon, 6=Sun
+    
+    if weekday == 6:  # Sunday -> Saturday was yesterday
+        sat = target_date - timedelta(days=1)
+    elif weekday == 5:  # Saturday -> today is Saturday
+        sat = target_date
+    else:  # Mon-Fri -> calculate next Saturday
+        days_to_sat = 5 - weekday
+        sat = target_date + timedelta(days=days_to_sat)
+    
+    start_str = sat.isoformat()
+    logger.info("get_weekend_page_data: target=%s weekday=%d sat=%s key=%s", 
+                target_date, weekday, sat, start_str)
     
     async with db.get_session() as session:
         page = await session.get(WeekendPage, start_str)
         if page and page.url:
-            return page.url, friday
+            logger.info("get_weekend_page_data: found WeekendPage url=%s", page.url)
+            return page.url, sat
             
     # Fallback to MonthPage if no WeekendPage
-    url = await get_month_page_url(db, friday)
-    return url, friday
+    logger.warning("get_weekend_page_data: no WeekendPage for %s, falling back to MonthPage", start_str)
+    url = await get_month_page_url(db, sat)
+    return url, sat
 
 async def get_next_month_url(db: Database, current_date: date) -> str | None:
     """Get URL for next month."""
@@ -172,10 +201,19 @@ async def handle_channel_post(message: types.Message):
         logger.debug("channel_nav: skipping command post %s", message.message_id)
         return
     
-    # 3. Filter: Rubrics
-    if is_rubric_post(text):
-        logger.info("channel_nav: skipping rubric post %s", message.message_id)
+    # 3. Filter: Triggers (Allowlist Logic for EVE-13)
+    # Only add buttons if the post explicitly contains trigger hashtags.
+    text_lower = text.lower()
+    has_trigger = any(tag in text_lower for tag in BUTTON_TRIGGER_HASHTAGS)
+    
+    if not has_trigger:
+        # If it doesn't have the trigger, we don't add buttons.
+        # But maybe we should still respect the old logic?
+        # The task says: "buttons are added not only in announcement channel... make it controlled check for #hashtags"
+        # So correct logic is: If NO trigger -> RETURN.
         return
+
+    # 4. Generate Buttons
 
     # 3. Filter: Forwarded messages? User didn't strictly specify, but usually forwards are not "admin content"
     # But admin might forward. User said "admin writes or scheduled". 

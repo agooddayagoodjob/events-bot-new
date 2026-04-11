@@ -1,0 +1,12 @@
+# Generated local render artifacts must never ship inside the Kaggle kernel bundle.
+output/
+output*/
+frames/
+frames*/
+render/
+render*/
+sequence/
+sequence*/
+*.mp4
+cover.png
+test_cover.png

@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+import random
 from collections import defaultdict
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -28,7 +29,7 @@ from models import (
 from .about import normalize_about_with_fallback
 from .kaggle_client import KaggleClient
 from .prompts import selection_prompt, selection_response_format, about_fill_prompt, about_fill_response_format
-from .types import (
+from .custom_types import (
     RankedChoice,
     RankedEvent,
     RenderPayload,
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 TELEGRAPH_EXCERPT_LIMIT = 1200
 POSTER_OCR_EXCERPT_LIMIT = 800
 TRACE_MAX_LEN = 100_000
+MAX_POSTER_URLS = 3
 
 
 def _is_fair_event(ev: Event) -> bool:
@@ -65,6 +67,8 @@ def _format_fair_time(value: str | None) -> str | None:
 
 
 def _build_fair_schedule_text(ev: Event) -> str | None:
+    if bool(getattr(ev, "end_date_is_inferred", False)):
+        return None
     raw_end = getattr(ev, "end_date", None)
     if not raw_end:
         return None
@@ -153,12 +157,41 @@ def _filter_events_with_posters(events: Sequence[Event]) -> list[Event]:
     return filtered
 
 
+_SOLD_OUT_STATUSES = {
+    "sold_out",
+    "soldout",
+    "распродано",
+    "билетов_нет",
+    "нет_билетов",
+}
+
+
+def _normalize_ticket_status(value: str | None) -> str:
+    text = (value or "").strip().casefold()
+    if not text:
+        return ""
+    text = text.replace("-", "_").replace(" ", "_")
+    text = re.sub(r"_+", "_", text)
+    return text
+
+
+def _is_sold_out_status(value: str | None) -> bool:
+    normalized = _normalize_ticket_status(value)
+    if not normalized:
+        return False
+    return normalized in _SOLD_OUT_STATUSES
+
+
 def _filter_events_by_ticket_status(
     events: Sequence[Event], *, allow_sold_out: bool
 ) -> list[Event]:
     if allow_sold_out:
         return list(events)
-    filtered = [e for e in events if getattr(e, "ticket_status", None) != "sold_out"]
+    filtered = [
+        e
+        for e in events
+        if not _is_sold_out_status(getattr(e, "ticket_status", None))
+    ]
     if len(filtered) != len(events):
         logger.info(
             "video_announce: dropped sold_out events total=%d filtered=%d",  # noqa: G004
@@ -227,6 +260,15 @@ def _event_sort_key(ev: Event) -> tuple[date, int, int]:
     return (base_date, _time_sort_key(_short_time_text(ev.time)), ev.id or 0)
 
 
+def _has_meaningful_ocr_text(value: str | None) -> bool:
+    """Treat punctuation/whitespace-only OCR as empty for /v poster selection."""
+
+    text = (value or "").strip()
+    if not text:
+        return False
+    return bool(re.search(r"[0-9A-Za-zА-Яа-яЁё]", text))
+
+
 def _build_schedule_info(
     events: Sequence[Event],
 ) -> tuple[str, list[dict[str, list[str]]]]:
@@ -277,7 +319,7 @@ def _dedupe_events(
         schedule_events = [
             ev
             for ev in group_events
-            if getattr(ev, "ticket_status", None) != "sold_out"
+            if not _is_sold_out_status(getattr(ev, "ticket_status", None))
         ]
         if not schedule_events:
             continue
@@ -370,6 +412,10 @@ async def fetch_candidates(
                         Event.end_date.is_not(None),
                         Event.end_date >= today_iso,
                         Event.date <= fallback_iso,
+                        or_(
+                            Event.end_date_is_inferred.is_(False),
+                            Event.end_date_is_inferred.is_(None),
+                        ),
                     ),
                 )
             )
@@ -467,9 +513,9 @@ async def _load_poster_ocr_texts(
     for poster in posters:
         text = (poster.ocr_text or "").strip()
         title = (poster.ocr_title or "").strip()
-        if text:
+        if _has_meaningful_ocr_text(text):
             grouped_text[poster.event_id].append(text)
-        if title and poster.event_id not in titles:
+        if _has_meaningful_ocr_text(title) and poster.event_id not in titles:
             titles[poster.event_id] = title
 
     excerpts: dict[int, str] = {}
@@ -487,6 +533,29 @@ async def _load_poster_ocr_texts(
             excerpts[event_id] = excerpt
 
     return excerpts, titles
+
+
+async def _filter_events_by_poster_ocr(
+    db: Database, events: Sequence[Event], *, allow_empty_ocr: bool = False
+) -> tuple[list[Event], dict[int, str], dict[int, str]]:
+    if not events:
+        return [], {}, {}
+    event_ids = [e.id for e in events if e.id is not None]
+    ocr_texts, ocr_titles = await _load_poster_ocr_texts(db, event_ids)
+    if allow_empty_ocr:
+        return list(events), ocr_texts, ocr_titles
+    with_text = set(ocr_texts.keys())
+    before = len(events)
+    filtered = [e for e in events if e.id is not None and e.id in with_text]
+    dropped = before - len(filtered)
+    if dropped:
+        logger.info(
+            "video_announce: dropped events without poster ocr_text total=%d kept=%d dropped=%d",
+            before,
+            len(filtered),
+            dropped,
+        )
+    return filtered, ocr_texts, ocr_titles
 
 
 def _apply_repeat_limit(
@@ -1089,12 +1158,20 @@ def build_payload(
 
 def payload_as_json(payload: RenderPayload, tz: timezone) -> str:
     def _poster_urls(ev: Event) -> list[str]:
-        urls = []
+        urls: list[str] = []
+        seen: set[str] = set()
         for url in getattr(ev, "photo_urls", []) or []:
+            if not url:
+                continue
             if url.startswith("http:"):
                 url = "https:" + url[5:]
+            if url in seen:
+                continue
+            seen.add(url)
             urls.append(url)
-        return urls[:1]
+            if len(urls) >= MAX_POSTER_URLS:
+                break
+        return urls
 
     def _is_missing_time(t: str) -> bool:
         if not t:
@@ -1173,6 +1250,8 @@ def payload_as_json(payload: RenderPayload, tz: timezone) -> str:
             )
 
         scene = {
+            "event_id": ev.id,
+            "title": (ev.title or "").strip(),
             "about": about_text,
             "description": item.final_description or "",
             "date": _format_scene_date(ev),
@@ -1194,6 +1273,8 @@ def payload_as_json(payload: RenderPayload, tz: timezone) -> str:
 
     # Build date string from events
     intro_date_str = ""
+    min_date = None
+    max_date = None
     if payload.events:
         dates_list: list[date] = []
         for ev in payload.events:
@@ -1213,16 +1294,27 @@ def payload_as_json(payload: RenderPayload, tz: timezone) -> str:
     # Extract intro_pattern from selection_params
     intro_pattern = str(selection_params.get("intro_pattern") or "STICKER")
 
+    intro_payload = {
+        "count": len(scenes),
+        "text": intro_str,
+        "date": intro_date_str,
+        "cities": event_cities[:4],  # Limit to 4 cities
+        "pattern": intro_pattern,  # Add pattern for notebook
+        "date_start": min_date.isoformat() if min_date else None,
+        "date_end": max_date.isoformat() if max_date else None,
+    }
+
+    selection_meta = {}
+    for key in ("mode", "test", "is_test", "allow_empty_ocr"):
+        if key in selection_params:
+            selection_meta[key] = selection_params.get(key)
+
     obj = {
-        "intro": {
-            "count": len(scenes),
-            "text": intro_str,
-            "date": intro_date_str,
-            "cities": event_cities[:4],  # Limit to 4 cities
-            "pattern": intro_pattern,  # Add pattern for notebook
-        },
+        "intro": intro_payload,
         "scenes": scenes,
     }
+    if selection_meta:
+        obj["selection_params"] = selection_meta
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
@@ -1265,18 +1357,107 @@ async def build_selection(
     occurrences_map: dict[int, list[dict[str, list[str]]]] | None = None,
     bot: Any | None = None,
     notify_chat_id: int | None = None,
+    auto_expand_min_posters: int | None = None,
+    auto_expand_step_days: int | None = None,
+    auto_expand_max_days: int | None = None,
 ) -> SelectionBuildResult:
     client = client or KaggleClient()
 
-    # Removed auto-expansion loop (Task Requirement: Отключить любое авторасширение дат/периодов)
+    def _parse_positive_int(value: int | str | None) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    prefetched_ocr_texts: dict[int, str] = {}
+    prefetched_ocr_titles: dict[int, str] = {}
+
+    async def _fetch_candidates_with_ocr(
+        current_ctx: SelectionContext,
+    ) -> tuple[
+        list[Event],
+        dict[int, str],
+        dict[int, list[dict[str, list[str]]]],
+        dict[int, str],
+        dict[int, str],
+    ]:
+        found, schedule_local, occurrences_local = await fetch_candidates(db, current_ctx)
+        schedule_local = schedule_local or {}
+        occurrences_local = occurrences_local or {}
+        filtered, ocr_texts, ocr_titles = await _filter_events_by_poster_ocr(
+            db,
+            found,
+            allow_empty_ocr=current_ctx.allow_empty_ocr,
+        )
+        return filtered, schedule_local, occurrences_local, ocr_texts, ocr_titles
+
+    min_posters = _parse_positive_int(auto_expand_min_posters)
+    expand_step_days = _parse_positive_int(auto_expand_step_days) or 1
+    max_window_days = _parse_positive_int(auto_expand_max_days)
+
     if candidates is not None:
         events = _filter_events_with_posters(list(candidates))
         schedule_map = schedule_map or {}
         occurrences_map = occurrences_map or {}
+        events, prefetched_ocr_texts, prefetched_ocr_titles = await _filter_events_by_poster_ocr(
+            db,
+            events,
+            allow_empty_ocr=ctx.allow_empty_ocr,
+        )
+    elif min_posters:
+        base_fallback = max(ctx.fallback_window_days, ctx.primary_window_days, 0)
+        max_window = max_window_days if max_window_days is not None else base_fallback
+        max_window = max(max_window, base_fallback)
+        fallback_days = base_fallback
+        events, schedule_map, occurrences_map, prefetched_ocr_texts, prefetched_ocr_titles = (
+            await _fetch_candidates_with_ocr(ctx)
+        )
+        expanded = False
+        while len(events) < min_posters and fallback_days < max_window:
+            next_fallback = min(max_window, fallback_days + expand_step_days)
+            if next_fallback == fallback_days:
+                break
+            fallback_days = next_fallback
+            expanded = True
+            current_ctx = replace(ctx, fallback_window_days=fallback_days)
+            (
+                events,
+                schedule_map,
+                occurrences_map,
+                prefetched_ocr_texts,
+                prefetched_ocr_titles,
+            ) = await _fetch_candidates_with_ocr(current_ctx)
+        if expanded:
+            logger.info(
+                "video_announce: auto-expanded selection window days=%d events=%d target=%d",
+                fallback_days,
+                len(events),
+                min_posters,
+            )
+            if len(events) < min_posters:
+                logger.warning(
+                    "video_announce: auto-expand limit reached days=%d events=%d target=%d",
+                    fallback_days,
+                    len(events),
+                    min_posters,
+                )
     else:
         events, schedule_map, occurrences_map = await fetch_candidates(db, ctx)
         schedule_map = schedule_map or {}
         occurrences_map = occurrences_map or {}
+        events, prefetched_ocr_texts, prefetched_ocr_titles = await _filter_events_by_poster_ocr(
+            db,
+            events,
+            allow_empty_ocr=ctx.allow_empty_ocr,
+        )
+
+    random_ocr_texts: dict[int, str] | None = None
+    random_ocr_titles: dict[int, str] | None = None
+    if ctx.random_order and events:
+        # Reuse OCR prefetch above (already filtered to ocr_text-only events).
+        random_ocr_texts = prefetched_ocr_texts
+        random_ocr_titles = prefetched_ocr_titles
 
     async def _rank_events(
         current_events: Sequence[Event],
@@ -1301,6 +1482,94 @@ async def build_selection(
                 promoted=promoted_local,
             )
         )
+        if ctx.random_order:
+            ranked_local: list[RankedEvent] = []
+            selected_ids_local: set[int] = set()
+            intro_text_local: str | None = None
+            intro_valid_local: bool = True
+
+            ocr_texts = random_ocr_texts or {}
+            ocr_titles = random_ocr_titles or {}
+
+            ocr_events = [e for e in selected_local if e.id is not None]
+            if not ctx.allow_empty_ocr:
+                ocr_event_ids = set(ocr_texts or {}) | set(ocr_titles or {})
+                if ocr_event_ids:
+                    with_ocr = [e for e in ocr_events if e.id in ocr_event_ids]
+                    if len(with_ocr) >= max(1, ctx.default_selected_max):
+                        ocr_events = with_ocr
+                    elif with_ocr:
+                        logger.warning(
+                            "video_announce: random_order using %d OCR + %d non-OCR events",
+                            len(with_ocr),
+                            len(ocr_events) - len(with_ocr),
+                        )
+                    else:
+                        logger.warning(
+                            "video_announce: random_order OCR missing for candidates, using titles",
+                        )
+            if not ocr_events:
+                return [], mandatory_ids_local, set(), None, True
+
+            mandatory_ocr = [e for e in ocr_events if e.id in mandatory_ids_local]
+            others_ocr = [e for e in ocr_events if e.id not in mandatory_ids_local]
+
+            others_with_title = [e for e in others_ocr if e.id in ocr_titles]
+            others_without_title = [e for e in others_ocr if e.id not in ocr_titles]
+            random.shuffle(others_with_title)
+            random.shuffle(others_without_title)
+
+            picked: list[Event] = []
+            seen: set[int] = set()
+            for ev in mandatory_ocr:
+                if ev.id is None or ev.id in seen:
+                    continue
+                picked.append(ev)
+                seen.add(ev.id)
+                if len(picked) >= ctx.default_selected_max:
+                    break
+
+            if len(picked) < ctx.default_selected_max:
+                for ev in others_with_title + others_without_title:
+                    if ev.id is None or ev.id in seen:
+                        continue
+                    picked.append(ev)
+                    seen.add(ev.id)
+                    if len(picked) >= ctx.default_selected_max:
+                        break
+
+            picked_ids = {e.id for e in picked if e.id is not None}
+            selected_ids_local = set(picked_ids)
+
+            ordered = sorted(ocr_events, key=_event_sort_key)
+
+            scores = client.score(ordered)
+            for pos, ev in enumerate(ordered, start=1):
+                if ev.id is None:
+                    continue
+                is_selected = ev.id in picked_ids
+                ranked_local.append(
+                    RankedEvent(
+                        event=ev,
+                        score=scores.get(ev.id, 0.0),
+                        position=pos,
+                        reason="Random selection" if is_selected else None,
+                        mandatory=ev.id in mandatory_ids_local,
+                        selected=is_selected,
+                        about=(ocr_titles.get(ev.id) or ev.title) if is_selected else None,
+                        poster_ocr_text=ocr_texts.get(ev.id),
+                        poster_ocr_title=ocr_titles.get(ev.id),
+                    )
+                )
+
+            return (
+                ranked_local,
+                mandatory_ids_local,
+                selected_ids_local,
+                intro_text_local,
+                intro_valid_local,
+            )
+
         selected_ids_local = {ev.id for ev in selected_local}
         ranked_local, intro_text_local, intro_valid_local = await _rank_with_llm(
             db,
@@ -1316,6 +1585,7 @@ async def build_selection(
             notify_chat_id=notify_chat_id,
             limit=ctx.default_selected_max,
         )
+
         return ranked_local, mandatory_ids_local, selected_ids_local, intro_text_local, intro_valid_local
 
     ranked, mandatory_ids, selected_ids, intro_text, intro_valid = await _rank_events(events)

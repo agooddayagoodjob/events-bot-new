@@ -6,8 +6,9 @@ import os
 import random
 import shutil
 import tempfile
+from fnmatch import fnmatch
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 KaggleApi = None  # type: ignore[assignment]
 _KAGGLE_IMPORT_ERROR: Exception | None = None
@@ -32,6 +33,110 @@ KERNELS_ROOT_PATH = Path(__file__).resolve().parent.parent / "kaggle"
 DEFAULT_KERNEL_PATH = KERNELS_ROOT_PATH / "VideoAfishaEventsBot"
 # Prefix to identify local kernels in kernel_ref
 LOCAL_KERNEL_PREFIX = "local:"
+DEFAULT_KERNEL_IGNORE_PATTERNS = (
+    ".kaggleignore",
+    ".ipynb_checkpoints/",
+    "__pycache__/",
+    ".pytest_cache/",
+    "*.pyc",
+    ".DS_Store",
+    "Thumbs.db",
+    "output/",
+    "output*/",
+    "frames/",
+    "frames*/",
+    "render/",
+    "render*/",
+    "sequence/",
+    "sequence*/",
+)
+
+
+def _should_force_gpu_for_local_kernel(
+    folder_name: str,
+    meta_data: dict[str, Any],
+) -> bool:
+    if str(folder_name or "").strip().casefold() == "crumplevideo":
+        return True
+    kernel_id = str(meta_data.get("id") or "").strip().casefold()
+    slug = str(meta_data.get("slug") or "").strip().casefold()
+    title = str(meta_data.get("title") or "").strip().casefold()
+    haystack = " ".join(part for part in (kernel_id, slug, title) if part)
+    return "crumple-video" in haystack or "crumple video" in haystack
+
+
+def _load_kernel_ignore_patterns(base_path: Path) -> list[str]:
+    patterns = list(DEFAULT_KERNEL_IGNORE_PATTERNS)
+    ignore_path = base_path / ".kaggleignore"
+    if not ignore_path.exists():
+        return patterns
+
+    for raw_line in ignore_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        patterns.append(line)
+    return patterns
+
+
+def _matches_kernel_ignore(
+    rel_path: Path,
+    *,
+    is_dir: bool,
+    patterns: Iterable[str],
+) -> bool:
+    rel = rel_path.as_posix()
+    name = rel_path.name
+    for pattern in patterns:
+        dir_only = pattern.endswith("/")
+        normalized = pattern.rstrip("/")
+        if not normalized:
+            continue
+        if dir_only and not is_dir:
+            continue
+        if fnmatch(rel, normalized) or fnmatch(name, normalized):
+            return True
+    return False
+
+
+def _copy_kernel_tree(src_root: Path, dst_root: Path) -> None:
+    patterns = _load_kernel_ignore_patterns(src_root)
+
+    def _copy_dir(src_dir: Path, dst_dir: Path, rel_dir: Path) -> None:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for item in sorted(src_dir.iterdir(), key=lambda p: p.name):
+            rel_path = rel_dir / item.name
+            if _matches_kernel_ignore(rel_path, is_dir=item.is_dir(), patterns=patterns):
+                logger.info("kaggle: skipping ignored kernel path=%s", rel_path.as_posix())
+                continue
+            dest = dst_dir / item.name
+            if item.is_dir():
+                _copy_dir(item, dest, rel_path)
+            else:
+                shutil.copy2(item, dest)
+
+    _copy_dir(src_root, dst_root, Path())
+
+
+def _prune_kernel_tree(root: Path) -> None:
+    patterns = _load_kernel_ignore_patterns(root)
+    if not patterns:
+        return
+
+    paths = sorted(
+        (p for p in root.rglob("*")),
+        key=lambda p: (len(p.relative_to(root).parts), p.as_posix()),
+        reverse=True,
+    )
+    for path in paths:
+        rel_path = path.relative_to(root)
+        if not _matches_kernel_ignore(rel_path, is_dir=path.is_dir(), patterns=patterns):
+            continue
+        logger.info("kaggle: pruning ignored kernel path=%s", rel_path.as_posix())
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink()
 
 
 def list_local_kernels() -> list[dict]:
@@ -60,11 +165,44 @@ def list_local_kernels() -> list[dict]:
                 "title": title,
                 "path": str(folder),
                 "is_local": True,
+                "id": meta.get("id"),
+                "slug": meta.get("slug"),
             })
         except Exception:
             logger.warning("Failed to parse kernel metadata in %s", folder)
             continue
     return kernels
+
+
+def _kernel_slug(kernel_ref: str) -> str:
+    ref = str(kernel_ref or "").strip()
+    if not ref:
+        return ""
+    if ref.startswith(LOCAL_KERNEL_PREFIX):
+        return ref[len(LOCAL_KERNEL_PREFIX):]
+    if "/" in ref:
+        return ref.rsplit("/", 1)[-1]
+    return ref
+
+
+def find_local_kernel(kernel_ref: str) -> dict[str, Any] | None:
+    """Return the repo-local kernel matching a requested local or Kaggle ref."""
+    normalized_ref = str(kernel_ref or "").strip()
+    if not normalized_ref:
+        return None
+
+    requested_slug = _kernel_slug(normalized_ref).casefold()
+    for kernel in list_local_kernels():
+        local_ref = str(kernel.get("ref") or "").strip()
+        if local_ref and local_ref == normalized_ref:
+            return kernel
+        local_id = str(kernel.get("id") or "").strip()
+        if local_id and local_id == normalized_ref:
+            return kernel
+        local_slug = str(kernel.get("slug") or "").strip().casefold()
+        if requested_slug and local_slug and local_slug == requested_slug:
+            return kernel
+    return None
 
 
 class KaggleClient:
@@ -131,6 +269,32 @@ class KaggleClient:
         )
         logger.info("kaggle: dataset created successfully from folder=%s", folder)
 
+    def create_dataset_version(
+        self,
+        folder: str | Path,
+        *,
+        version_notes: str = "update",
+        quiet: bool = True,
+        convert_to_csv: bool = False,
+        delete_old_versions: bool = False,
+        dir_mode: str = "zip",
+    ) -> None:
+        api = self._get_api()
+        logger.info(
+            "kaggle: creating dataset version folder=%s notes=%s",
+            folder,
+            version_notes,
+        )
+        api.dataset_create_version(
+            str(folder),
+            version_notes=version_notes,
+            quiet=quiet,
+            convert_to_csv=convert_to_csv,
+            delete_old_versions=delete_old_versions,
+            dir_mode=dir_mode,
+        )
+        logger.info("kaggle: dataset version created successfully folder=%s", folder)
+
     def delete_dataset(self, dataset: str, *, no_confirm: bool = True) -> None:
         api = self._get_api()
         if "/" in dataset:
@@ -154,14 +318,24 @@ class KaggleClient:
         api = self._get_api()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            for item in base_path.iterdir():
-                dest = tmp_path / item.name
-                if item.is_dir():
-                    shutil.copytree(item, dest)
-                else:
-                    shutil.copy2(item, dest)
+            _copy_kernel_tree(base_path, tmp_path)
             meta_path = tmp_path / "kernel-metadata.json"
             meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+            username = (os.getenv("KAGGLE_USERNAME") or "").strip()
+            kernel_id = str(meta_data.get("id") or "").strip()
+            if username and kernel_id:
+                if "/" in kernel_id:
+                    owner, slug = kernel_id.split("/", 1)
+                else:
+                    owner, slug = "", kernel_id
+                if slug and owner != username:
+                    new_id = f"{username}/{slug}"
+                    logger.info(
+                        "kaggle: overriding kernel owner old_id=%s new_id=%s",
+                        kernel_id,
+                        new_id,
+                    )
+                    meta_data["id"] = new_id
             if dataset_sources is not None:
                 meta_data["dataset_sources"] = dataset_sources
                 meta_path.write_text(json.dumps(meta_data, ensure_ascii=False, indent=2))
@@ -193,84 +367,101 @@ class KaggleClient:
         api = self._get_api()
         api.kernels_pull(kernel_ref, path=str(path), metadata=metadata)
 
-    def deploy_kernel_update(self, kernel_ref: str, dataset_slug: str) -> str:
+    def deploy_kernel_update(
+        self, kernel_ref: str, dataset_sources: str | list[str]
+    ) -> str:
         """Deploy kernel with dataset sources updated.
         
         HYBRID approach:
-        - If kernel_ref starts with 'local:', use code from repository
-        - Otherwise, pull from Kaggle (original behavior)
+        - If a matching repo-local kernel exists, use repo code/metadata as source of truth
+        - Otherwise, pull from Kaggle as a fallback
         """
         import time
         api = self._get_api()
-        
-        is_local = kernel_ref.startswith(LOCAL_KERNEL_PREFIX)
-        
+
+        local_kernel = find_local_kernel(kernel_ref)
+        is_local = local_kernel is not None
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            
+
             if is_local:
-                # Extract folder name from local:FolderName
-                folder_name = kernel_ref[len(LOCAL_KERNEL_PREFIX):]
-                local_kernel_path = KERNELS_ROOT_PATH / folder_name
-                
+                local_kernel_path = Path(str(local_kernel.get("path") or ""))
                 if not local_kernel_path.exists():
                     raise FileNotFoundError(f"Local kernel path not found: {local_kernel_path}")
-                
+
                 logger.info(
-                    "kaggle: deploying LOCAL kernel folder=%s dataset=%s",
-                    folder_name, dataset_slug
+                    "kaggle: deploying REPO kernel source=%s requested_ref=%s datasets=%s",
+                    local_kernel_path.name,
+                    kernel_ref,
+                    dataset_sources,
                 )
                 logger.info(
                     "kaggle: local kernel path resolved=%s",
                     local_kernel_path.resolve(),
                 )
-                
-                # Copy local kernel files to temp directory
-                for item in local_kernel_path.iterdir():
-                    dest = tmp_path / item.name
-                    if item.is_dir():
-                        shutil.copytree(item, dest)
-                    else:
-                        shutil.copy2(item, dest)
+
+                _copy_kernel_tree(local_kernel_path, tmp_path)
                 logger.info("kaggle: copied local kernel from %s", local_kernel_path)
             else:
-                # Pull from Kaggle (original behavior)
                 logger.info(
-                    "kaggle: deploying REMOTE kernel ref=%s dataset=%s",
-                    kernel_ref, dataset_slug
+                    "kaggle: deploying REMOTE kernel ref=%s datasets=%s",
+                    kernel_ref,
+                    dataset_sources,
                 )
                 api.kernels_pull(kernel_ref, path=str(tmp_path), metadata=True)
+                _prune_kernel_tree(tmp_path)
                 logger.info("kaggle: pulled kernel from Kaggle")
-            
+
             meta_path = tmp_path / "kernel-metadata.json"
             if not meta_path.exists():
                 raise FileNotFoundError(f"kernel-metadata.json not found")
 
             meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+            requested_ref = str(kernel_ref or "").strip()
+            if requested_ref and not requested_ref.startswith(LOCAL_KERNEL_PREFIX):
+                meta_data["id"] = requested_ref
+            username = (os.getenv("KAGGLE_USERNAME") or "").strip()
+            kernel_id = str(meta_data.get("id") or "").strip()
+            if username and kernel_id:
+                if "/" in kernel_id:
+                    owner, slug = kernel_id.split("/", 1)
+                else:
+                    owner, slug = "", kernel_id
+                if slug and owner != username:
+                    new_id = f"{username}/{slug}"
+                    logger.info(
+                        "kaggle: overriding deployed kernel owner old_id=%s new_id=%s",
+                        kernel_id,
+                        new_id,
+                    )
+                    meta_data["id"] = new_id
             
-            # Update kernel id to match current user's account from env
-            # Use fixed slug - Kaggle handles versioning automatically
-            username = os.getenv("KAGGLE_USERNAME")
-            if username:
-                fixed_slug = "video-afisha"
-                new_id = f"{username}/{fixed_slug}"
-                old_id = meta_data.get("id", "")
-                
-                logger.info("kaggle: setting kernel id=%s (was %s)", new_id, old_id)
-                meta_data["id"] = new_id
-                meta_data["slug"] = fixed_slug
-                # Title must match slug pattern for Kaggle to accept
-                meta_data["title"] = "Video Afisha"
-            
-            # Set dataset sources for this session
-            meta_data["dataset_sources"] = [dataset_slug]
-            # Ensure internet is enabled for pip installs
+            # Set dataset sources for this session while preserving any static inputs
+            requested_sources = (
+                [dataset_sources]
+                if isinstance(dataset_sources, str)
+                else list(dataset_sources)
+            )
+            existing_sources = meta_data.get("dataset_sources", [])
+            for dataset_slug in requested_sources:
+                if dataset_slug not in existing_sources:
+                    existing_sources.append(dataset_slug)
+            meta_data["dataset_sources"] = existing_sources
             meta_data["enable_internet"] = True
-            
+            local_kernel_name = (
+                local_kernel_path.name
+                if is_local
+                else str(meta_data.get("slug") or meta_data.get("id") or "")
+            )
+            if is_local and _should_force_gpu_for_local_kernel(local_kernel_name, meta_data):
+                meta_data["enable_gpu"] = True
+
             logger.info(
-                "kaggle: kernel metadata updated id=%s dataset_sources=%s",
+                "kaggle: kernel metadata updated id=%s dataset_sources=%s enable_gpu=%s",
                 meta_data.get("id"),
                 meta_data.get("dataset_sources"),
+                meta_data.get("enable_gpu"),
             )
 
             meta_path.write_text(json.dumps(meta_data, ensure_ascii=False, indent=2))
@@ -330,6 +521,41 @@ class KaggleClient:
             result.get("failureMessage") or result.get("failure_message"),
         )
         return result
+
+    def kernel_has_dataset_sources(
+        self,
+        kernel_ref: str,
+        expected_sources: list[str],
+    ) -> tuple[bool, dict[str, Any]]:
+        expected_clean = [str(item).strip() for item in expected_sources if str(item).strip()]
+        if not expected_clean:
+            return True, {"dataset_sources": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            self.kernels_pull(kernel_ref, tmp_path, metadata=True)
+            meta_path = tmp_path / "kernel-metadata.json"
+            if not meta_path.exists():
+                raise FileNotFoundError(
+                    f"kernel-metadata.json not found after pulling {kernel_ref}"
+                )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        actual_sources = [
+            str(item).strip()
+            for item in (meta.get("dataset_sources") or [])
+            if str(item).strip()
+        ]
+        matched = all(item in actual_sources for item in expected_clean)
+        meta["dataset_sources"] = actual_sources
+        logger.info(
+            "kaggle: kernel dataset sources kernel=%s matched=%s expected=%s actual=%s",
+            kernel_ref,
+            matched,
+            expected_clean,
+            actual_sources,
+        )
+        return matched, meta
 
     def download_kernel_output(
         self, kernel_ref: str, *, path: str | Path, force: bool = True, quiet: bool = False

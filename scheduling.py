@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import json
 import logging
 import os
 import time as _time
@@ -9,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from uuid import uuid4
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.events import (
     EVENT_JOB_ERROR,
@@ -20,7 +22,10 @@ from apscheduler.events import (
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from admin_chat import resolve_superadmin_chat_id
 from db import optimize, wal_checkpoint_truncate, vacuum
+from heavy_ops import current_heavy_meta, describe_heavy_meta, heavy_operation
+from ops_run import finish_ops_run, start_ops_run
 from runtime import get_running_main
 
 
@@ -32,6 +37,17 @@ class Job:
     depends_on: Set[str] = field(default_factory=set)
     dirty: bool = False
     track: bool = True
+
+
+@dataclass(frozen=True)
+class _CriticalScheduledSlot:
+    kind: str
+    job_id: str
+    scheduled_local: datetime
+    scheduled_utc: datetime
+    next_scheduled_utc: datetime
+    misfire_grace_seconds: int
+    slot_key: str
 
 
 MONTHS_NOM = [
@@ -65,6 +81,910 @@ MONTHS_GEN = [
     "ноября",
     "декабря",
 ]
+
+
+async def _run_scheduled_guide_excursions(
+    db,
+    bot,
+    *,
+    mode: str,
+) -> None:
+    target_chat_id = await resolve_superadmin_chat_id(db)
+    try:
+        guide_service = importlib.import_module("guide_excursions.service")
+    except Exception as exc:
+        logging.exception("SCHED scheduled guide monitor bootstrap failed mode=%s", mode)
+        error_text = f"{type(exc).__name__}: {exc}"
+        details = {
+            "mode": mode,
+            "transport": "bootstrap_error",
+            "phase": "import_service",
+            "errors": [error_text],
+            "source_reports": [],
+            "occurrence_changes": [],
+        }
+        metrics = {
+            "sources_scanned": 0,
+            "posts_scanned": 0,
+            "posts_prefiltered": 0,
+            "occurrences_created": 0,
+            "occurrences_updated": 0,
+            "templates_touched": 0,
+            "profiles_touched": 0,
+            "past_occurrences_skipped": 0,
+            "llm_ok": 0,
+            "llm_deferred": 0,
+            "llm_error": 0,
+            "errors": 1,
+            "duration_sec": 0,
+        }
+        ops_run_id = await start_ops_run(
+            db,
+            kind="guide_monitoring",
+            trigger="scheduled",
+            chat_id=target_chat_id,
+            operator_id=None,
+            details=details,
+        )
+        await finish_ops_run(
+            db,
+            run_id=ops_run_id,
+            status="error",
+            metrics=metrics,
+            details=details,
+        )
+        if target_chat_id and bot is not None and hasattr(bot, "send_message"):
+            try:
+                await bot.send_message(
+                    int(target_chat_id),
+                    (
+                        "❌ Scheduled guide monitoring stopped before scan\n"
+                        f"mode={mode}\n"
+                        "phase=import_service\n"
+                        f"reason={error_text}"
+                    ),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logging.exception("SCHED failed to notify admin about scheduled guide bootstrap failure")
+        return
+
+    result = await guide_service.run_guide_monitor(
+        db,
+        bot,
+        chat_id=target_chat_id,
+        operator_id=None,
+        trigger="scheduled",
+        mode=mode,
+        send_progress=bool(target_chat_id),
+    )
+    auto_publish = _env_enabled("ENABLE_GUIDE_DIGEST_SCHEDULED", default=False)
+    recovery_kernel_ref = getattr(result, "recovery_kernel_ref", None)
+    import_completed = bool(getattr(result, "import_completed", False))
+
+    async def _clear_recovery_job_if_ready() -> None:
+        if not recovery_kernel_ref or not import_completed:
+            return
+        try:
+            await guide_service.clear_guide_monitor_recovery_job(recovery_kernel_ref)
+        except Exception:
+            logging.exception(
+                "SCHED failed to clear guide_monitor recovery job kernel=%s",
+                recovery_kernel_ref,
+            )
+
+    needs_auto_publish = bool(auto_publish and mode == "full" and not result.errors)
+    if not needs_auto_publish:
+        await _clear_recovery_job_if_ready()
+        return
+    if bot is None:
+        return
+    try:
+        publish_result = await guide_service.publish_guide_digest(
+            db,
+            bot,
+            family="new_occurrences",
+            chat_id=target_chat_id,
+        )
+    except Exception as exc:
+        logging.exception("SCHED scheduled guide digest publish failed")
+        if target_chat_id:
+            try:
+                await bot.send_message(
+                    int(target_chat_id),
+                    (
+                        "❌ Scheduled guide digest publish stopped\n"
+                        f"reason={str(exc) or type(exc).__name__}"
+                    ),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logging.exception("SCHED failed to notify admin about scheduled guide digest publish failure")
+        return
+    await _clear_recovery_job_if_ready()
+    if target_chat_id and publish_result.get("published"):
+        try:
+            await bot.send_message(
+                int(target_chat_id),
+                (
+                    "📣 Scheduled guide digest published\n"
+                    f"issue_id={publish_result.get('issue_id')}\n"
+                    f"targets={', '.join(publish_result.get('target_chats') or [str(publish_result.get('target_chat') or '—')])}"
+                ),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logging.exception("SCHED failed to notify admin about scheduled guide digest publish")
+
+
+async def _run_scheduled_video_tomorrow_test(
+    db,
+    bot,
+    *,
+    profile_key: str,
+) -> None:
+    await _run_scheduled_video_tomorrow(
+        db,
+        bot,
+        profile_key=profile_key,
+        test_mode=True,
+    )
+
+
+async def _run_scheduled_video_tomorrow(
+    db,
+    bot,
+    *,
+    profile_key: str,
+    test_mode: bool = False,
+    startup_catchup: bool = False,
+) -> None:
+    from video_announce.scenario import (
+        DEFAULT_SELECTED_MAX,
+        TOMORROW_TEST_MIN_POSTERS,
+        VideoAnnounceScenario,
+    )
+
+    normalized_profile_key = (profile_key or "default").strip() or "default"
+    ops_details: dict[str, Any] = {
+        "profile_key": normalized_profile_key,
+        "test_mode": bool(test_mode),
+        "startup_catchup": bool(startup_catchup),
+    }
+    ops_run_id = await start_ops_run(
+        db,
+        kind="video_tomorrow",
+        trigger="scheduled",
+        operator_id=0,
+        details=ops_details,
+    )
+    target_chat_id = await resolve_superadmin_chat_id(db)
+    if not target_chat_id or bot is None:
+        logging.warning(
+            "SCHED skipping video_tomorrow: missing target_chat_id=%s or bot=%s",
+            target_chat_id,
+            bot is not None,
+        )
+        ops_details["skip_reason"] = "missing_target_chat_or_bot"
+        await finish_ops_run(
+            db,
+            run_id=ops_run_id,
+            status="skipped",
+            details=ops_details,
+        )
+        return
+
+    try:
+        scenario = VideoAnnounceScenario(
+            db,
+            bot,
+            chat_id=int(target_chat_id),
+            user_id=int(target_chat_id),
+        )
+        await scenario.run_tomorrow_pipeline(
+            profile_key=normalized_profile_key,
+            selected_max=TOMORROW_TEST_MIN_POSTERS if test_mode else DEFAULT_SELECTED_MAX,
+            test_mode=test_mode,
+        )
+    except Exception as exc:
+        ops_details["error"] = str(exc) or type(exc).__name__
+        await finish_ops_run(
+            db,
+            run_id=ops_run_id,
+            status="failed",
+            details=ops_details,
+        )
+        raise
+
+    await finish_ops_run(
+        db,
+        run_id=ops_run_id,
+        status="success",
+        details=ops_details,
+    )
+
+
+def _cron_from_local(
+    time_raw: str,
+    tz_name: str,
+    *,
+    default_hour: str,
+    default_minute: str,
+    label: str,
+) -> tuple[str, str]:
+    hour = default_hour
+    minute = default_minute
+    try:
+        if time_raw:
+            hh, mm = map(int, time_raw.split(":"))
+            tz = ZoneInfo(tz_name)
+            local_dt = datetime.now(tz).replace(hour=hh, minute=mm, second=0, microsecond=0)
+            utc_dt = local_dt.astimezone(timezone.utc)
+            hour = str(utc_dt.hour)
+            minute = str(utc_dt.minute)
+    except Exception:
+        logging.warning(
+            "invalid %s time=%s tz=%s; using %s:%s UTC",
+            label,
+            time_raw,
+            tz_name,
+            default_hour,
+            default_minute,
+        )
+    return hour, minute
+
+
+def _safe_zoneinfo(tz_name: str, *, label: str) -> timezone | ZoneInfo:
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        logging.warning("invalid %s timezone=%s; using UTC", label, tz_name)
+        return timezone.utc
+
+
+def _env_enabled(key: str, *, default: bool = False) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _first_env(*keys: str, default: str | None = None) -> str | None:
+    for key in keys:
+        raw = os.getenv(key)
+        if raw is not None and raw.strip():
+            return raw.strip()
+    return default
+
+
+def _parse_hhmm(
+    time_raw: str,
+    *,
+    default_hour: int,
+    default_minute: int,
+    label: str,
+) -> tuple[int, int]:
+    try:
+        if time_raw:
+            hh, mm = map(int, time_raw.split(":"))
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return hh, mm
+    except Exception:
+        pass
+    logging.warning(
+        "invalid %s time=%s; using %02d:%02d local",
+        label,
+        time_raw,
+        default_hour,
+        default_minute,
+    )
+    return default_hour, default_minute
+
+
+def _video_tomorrow_schedule_settings() -> tuple[bool, str, str, str, bool]:
+    production_enabled = _env_enabled("ENABLE_V_TOMORROW_SCHEDULED", default=False)
+    legacy_enabled = _env_enabled("ENABLE_V_TEST_TOMORROW_SCHEDULED", default=False)
+    enabled = production_enabled or legacy_enabled
+    if production_enabled:
+        video_tz_name = _first_env(
+            "V_TOMORROW_TZ",
+            default="Europe/Kaliningrad",
+        ) or "Europe/Kaliningrad"
+        video_time_raw = _first_env(
+            "V_TOMORROW_TIME_LOCAL",
+            default="16:45",
+        ) or "16:45"
+        video_profile_key = _first_env(
+            "V_TOMORROW_PROFILE",
+            default="default",
+        ) or "default"
+    else:
+        video_tz_name = _first_env(
+            "V_TEST_TOMORROW_TZ",
+            default="Europe/Kaliningrad",
+        ) or "Europe/Kaliningrad"
+        video_time_raw = _first_env(
+            "V_TEST_TOMORROW_TIME_LOCAL",
+            default="16:45",
+        ) or "16:45"
+        video_profile_key = _first_env(
+            "V_TEST_TOMORROW_PROFILE",
+            default="default",
+        ) or "default"
+    video_test_mode = _env_enabled("V_TOMORROW_TEST_MODE", default=False)
+    return enabled, video_tz_name, video_time_raw, video_profile_key, video_test_mode
+
+
+def video_tomorrow_watchdog_enabled() -> bool:
+    enabled, _, _, _, _ = _video_tomorrow_schedule_settings()
+    return enabled
+
+
+def _video_tomorrow_misfire_grace_seconds() -> int:
+    raw = (os.getenv("V_TOMORROW_MISFIRE_GRACE_SECONDS") or "").strip()
+    try:
+        value = int(raw) if raw else 600
+    except ValueError:
+        value = 600
+    return max(30, value)
+
+
+def _video_tomorrow_watchdog_grace_seconds() -> int:
+    raw = (os.getenv("V_TOMORROW_WATCHDOG_GRACE_SECONDS") or "").strip()
+    try:
+        value = int(raw) if raw else 720
+    except ValueError:
+        value = 720
+    return max(60, value)
+
+
+def _utc_sql_text(dt: datetime) -> str:
+    value = dt
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _video_tomorrow_dispatch_exists_today(
+    db: Any,
+    *,
+    day_start_utc: datetime,
+    day_end_utc: datetime,
+) -> bool:
+    if db is None or not hasattr(db, "raw_conn"):
+        return False
+    async with db.raw_conn() as conn:
+        cur = await conn.execute(
+            """
+            SELECT 1
+            FROM ops_run
+            WHERE kind = 'video_tomorrow'
+              AND trigger = 'scheduled'
+              AND status IN ('running', 'success')
+              AND started_at >= ?
+              AND started_at < ?
+            LIMIT 1
+            """,
+            (_utc_sql_text(day_start_utc), _utc_sql_text(day_end_utc)),
+        )
+        row = await cur.fetchone()
+    return bool(row)
+
+
+async def _video_tomorrow_session_exists_today(
+    db: Any,
+    *,
+    day_start_utc: datetime,
+    day_end_utc: datetime,
+    profile_key: str,
+    target_date: str,
+) -> bool:
+    if db is None or not hasattr(db, "raw_conn"):
+        return False
+    async with db.raw_conn() as conn:
+        cur = await conn.execute(
+            """
+            SELECT status, profile_key, selection_params
+            FROM videoannounce_session
+            WHERE created_at >= ?
+              AND created_at < ?
+            ORDER BY id DESC
+            """,
+            (_utc_sql_text(day_start_utc), _utc_sql_text(day_end_utc)),
+        )
+        rows = await cur.fetchall()
+    for status, row_profile_key, selection_params_raw in rows:
+        if str(row_profile_key or "").strip() != profile_key:
+            continue
+        if str(status or "").strip() not in _VIDEO_TOMORROW_EXISTING_SESSION_STATUSES:
+            continue
+        params: dict[str, Any] = {}
+        if isinstance(selection_params_raw, str) and selection_params_raw.strip():
+            try:
+                parsed = json.loads(selection_params_raw)
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, dict):
+                params = parsed
+        elif isinstance(selection_params_raw, dict):
+            params = selection_params_raw
+        if str(params.get("target_date") or "").strip() == target_date:
+            return True
+    return False
+
+
+async def _maybe_catch_up_video_tomorrow_on_startup(db: Any, bot: Any) -> bool:
+    enabled, video_tz_name, video_time_raw, profile_key, video_test_mode = _video_tomorrow_schedule_settings()
+    if not enabled:
+        return False
+    video_tz = _safe_zoneinfo(video_tz_name, label="V_TOMORROW_TZ")
+    hour_local, minute_local = _parse_hhmm(
+        video_time_raw,
+        default_hour=16,
+        default_minute=45,
+        label="V_TOMORROW_TIME_LOCAL",
+    )
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(video_tz)
+    scheduled_local = now_local.replace(
+        hour=hour_local,
+        minute=minute_local,
+        second=0,
+        microsecond=0,
+    )
+    if now_local <= scheduled_local + timedelta(seconds=30):
+        return False
+
+    day_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end_local = day_start_local + timedelta(days=1)
+    day_start_utc = day_start_local.astimezone(timezone.utc)
+    day_end_utc = day_end_local.astimezone(timezone.utc)
+    if await _video_tomorrow_dispatch_exists_today(
+        db,
+        day_start_utc=day_start_utc,
+        day_end_utc=day_end_utc,
+    ):
+        logging.info(
+            "SCHED startup catchup skip video_tomorrow: scheduled dispatch already recorded today"
+        )
+        return False
+
+    target_date = (now_local + timedelta(days=1)).date().isoformat()
+    normalized_profile_key = (profile_key or "default").strip() or "default"
+    if await _video_tomorrow_session_exists_today(
+        db,
+        day_start_utc=day_start_utc,
+        day_end_utc=day_end_utc,
+        profile_key=normalized_profile_key,
+        target_date=target_date,
+    ):
+        logging.info(
+            "SCHED startup catchup skip video_tomorrow: matching session already exists today"
+        )
+        return False
+
+    logging.warning(
+        "SCHED startup catchup dispatching missed video_tomorrow slot scheduled_local=%s now_local=%s",
+        scheduled_local.isoformat(),
+        now_local.isoformat(),
+    )
+    await _run_scheduled_video_tomorrow(
+        db,
+        bot,
+        profile_key=normalized_profile_key,
+        test_mode=video_test_mode,
+        startup_catchup=True,
+    )
+    return True
+
+
+async def maybe_dispatch_video_tomorrow_watchdog(db: Any, bot: Any) -> bool:
+    enabled, video_tz_name, video_time_raw, profile_key, video_test_mode = (
+        _video_tomorrow_schedule_settings()
+    )
+    if not enabled:
+        return False
+    video_tz = _safe_zoneinfo(video_tz_name, label="V_TOMORROW_TZ")
+    hour_local, minute_local = _parse_hhmm(
+        video_time_raw,
+        default_hour=16,
+        default_minute=45,
+        label="V_TOMORROW_TIME_LOCAL",
+    )
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(video_tz)
+    scheduled_local = now_local.replace(
+        hour=hour_local,
+        minute=minute_local,
+        second=0,
+        microsecond=0,
+    )
+    watchdog_delay_sec = max(
+        _video_tomorrow_watchdog_grace_seconds(),
+        _video_tomorrow_misfire_grace_seconds() + 120,
+    )
+    if now_local <= scheduled_local + timedelta(seconds=watchdog_delay_sec):
+        return False
+
+    day_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end_local = day_start_local + timedelta(days=1)
+    day_start_utc = day_start_local.astimezone(timezone.utc)
+    day_end_utc = day_end_local.astimezone(timezone.utc)
+    if await _video_tomorrow_dispatch_exists_today(
+        db,
+        day_start_utc=day_start_utc,
+        day_end_utc=day_end_utc,
+    ):
+        return False
+
+    target_date = (now_local + timedelta(days=1)).date().isoformat()
+    normalized_profile_key = (profile_key or "default").strip() or "default"
+    if await _video_tomorrow_session_exists_today(
+        db,
+        day_start_utc=day_start_utc,
+        day_end_utc=day_end_utc,
+        profile_key=normalized_profile_key,
+        target_date=target_date,
+    ):
+        return False
+
+    logging.error(
+        "SCHED watchdog dispatching missing live video_tomorrow slot scheduled_local=%s now_local=%s",
+        scheduled_local.isoformat(),
+        now_local.isoformat(),
+    )
+    await _run_scheduled_video_tomorrow(
+        db,
+        bot,
+        profile_key=normalized_profile_key,
+        test_mode=video_test_mode,
+        startup_catchup=False,
+    )
+    return True
+
+
+def _env_int_seconds(key: str, *, default: int, minimum: int) -> int:
+    raw = (os.getenv(key) or "").strip()
+    try:
+        value = int(raw) if raw else int(default)
+    except ValueError:
+        value = int(default)
+    return max(int(minimum), value)
+
+
+def _critical_scheduler_watchdog_interval_seconds() -> int:
+    return _env_int_seconds(
+        "CRITICAL_SCHED_WATCHDOG_INTERVAL_SECONDS",
+        default=60,
+        minimum=15,
+    )
+
+
+def _critical_scheduler_watchdog_grace_seconds() -> int:
+    return _env_int_seconds(
+        "CRITICAL_SCHED_WATCHDOG_GRACE_SECONDS",
+        default=300,
+        minimum=60,
+    )
+
+
+def _critical_job_misfire_grace_seconds(kind: str) -> int:
+    if kind == "tg_monitoring":
+        return _env_int_seconds(
+            "TG_MONITORING_MISFIRE_GRACE_SECONDS",
+            default=1800,
+            minimum=30,
+        )
+    if kind == "vk_auto_import":
+        return _env_int_seconds(
+            "VK_AUTO_IMPORT_MISFIRE_GRACE_SECONDS",
+            default=1800,
+            minimum=30,
+        )
+    return 30
+
+
+def _critical_job_catchup_lookback_seconds(kind: str) -> int:
+    if kind == "tg_monitoring":
+        return _env_int_seconds(
+            "TG_MONITORING_CATCHUP_LOOKBACK_SECONDS",
+            default=24 * 3600,
+            minimum=3600,
+        )
+    if kind == "vk_auto_import":
+        return _env_int_seconds(
+            "VK_AUTO_IMPORT_CATCHUP_LOOKBACK_SECONDS",
+            default=24 * 3600,
+            minimum=3600,
+        )
+    return 24 * 3600
+
+
+def critical_scheduler_watchdog_enabled() -> bool:
+    is_prod = os.getenv("DEV_MODE") != "1" and os.getenv("PYTEST_CURRENT_TEST") is None
+    tg_enabled = _env_enabled("ENABLE_TG_MONITORING", default=is_prod)
+    vk_enabled = _env_enabled("ENABLE_VK_AUTO_IMPORT", default=False)
+    return tg_enabled or vk_enabled
+
+
+def _critical_schedule_specs(*, is_prod: bool | None = None) -> list[dict[str, Any]]:
+    if is_prod is None:
+        is_prod = os.getenv("DEV_MODE") != "1" and os.getenv("PYTEST_CURRENT_TEST") is None
+    specs: list[dict[str, Any]] = []
+    if _env_enabled("ENABLE_TG_MONITORING", default=bool(is_prod)):
+        specs.append(
+            {
+                "kind": "tg_monitoring",
+                "job_id": "tg_monitoring",
+                "times": [os.getenv("TG_MONITORING_TIME_LOCAL", "23:40").strip() or "23:40"],
+                "tz": os.getenv("TG_MONITORING_TZ", "Europe/Kaliningrad").strip()
+                or "Europe/Kaliningrad",
+                "default_hour": 23,
+                "default_minute": 40,
+                "label": "TG_MONITORING_TIME_LOCAL",
+            }
+        )
+    if _env_enabled("ENABLE_VK_AUTO_IMPORT", default=False):
+        times_raw = os.getenv(
+            "VK_AUTO_IMPORT_TIMES_LOCAL", "06:15,10:15,12:00,18:30"
+        ).strip()
+        times = [part.strip() for part in times_raw.split(",") if part.strip()]
+        if not times:
+            times = ["06:15", "10:15", "12:00", "18:30"]
+        specs.append(
+            {
+                "kind": "vk_auto_import",
+                "job_id": "vk_auto_import",
+                "times": times,
+                "tz": os.getenv("VK_AUTO_IMPORT_TZ", "Europe/Kaliningrad").strip()
+                or "Europe/Kaliningrad",
+                "default_hour": 6,
+                "default_minute": 30,
+                "label": "VK_AUTO_IMPORT_TIMES_LOCAL",
+            }
+        )
+    return specs
+
+
+def _critical_due_slots(
+    *,
+    now_utc: datetime | None = None,
+    startup: bool,
+) -> list[_CriticalScheduledSlot]:
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    delay_floor = 30 if startup else _critical_scheduler_watchdog_grace_seconds()
+    slots: list[_CriticalScheduledSlot] = []
+    for spec in _critical_schedule_specs():
+        kind = str(spec["kind"])
+        tz = _safe_zoneinfo(str(spec["tz"]), label=f"{kind}_TZ")
+        now_local = now.astimezone(tz)
+        candidates: list[datetime] = []
+        for raw_time in spec["times"]:
+            hour, minute = _parse_hhmm(
+                str(raw_time),
+                default_hour=int(spec["default_hour"]),
+                default_minute=int(spec["default_minute"]),
+                label=str(spec["label"]),
+            )
+            for offset in (-1, 0, 1):
+                day = now_local.date() + timedelta(days=offset)
+                candidates.append(
+                    datetime(
+                        day.year,
+                        day.month,
+                        day.day,
+                        hour,
+                        minute,
+                        tzinfo=tz,
+                    )
+                )
+        candidates = sorted(set(candidates))
+        due = [candidate for candidate in candidates if candidate <= now_local]
+        if not due:
+            continue
+        scheduled_local = due[-1]
+        scheduled_utc = scheduled_local.astimezone(timezone.utc)
+        lookback_seconds = _critical_job_catchup_lookback_seconds(kind)
+        if now - scheduled_utc > timedelta(seconds=lookback_seconds):
+            continue
+        misfire_grace = _critical_job_misfire_grace_seconds(kind)
+        delay_seconds = delay_floor if startup else max(delay_floor, misfire_grace + 120)
+        if now < scheduled_utc + timedelta(seconds=delay_seconds):
+            continue
+        next_candidates = [
+            candidate.astimezone(timezone.utc)
+            for candidate in candidates
+            if candidate > scheduled_local
+        ]
+        next_scheduled_utc = min(next_candidates) if next_candidates else scheduled_utc + timedelta(days=1)
+        slots.append(
+            _CriticalScheduledSlot(
+                kind=kind,
+                job_id=str(spec["job_id"]),
+                scheduled_local=scheduled_local,
+                scheduled_utc=scheduled_utc,
+                next_scheduled_utc=next_scheduled_utc,
+                misfire_grace_seconds=misfire_grace,
+                slot_key=f"{kind}:{scheduled_utc.strftime('%Y%m%dT%H%M%SZ')}",
+            )
+        )
+    return sorted(slots, key=lambda slot: slot.scheduled_utc)
+
+
+async def _critical_slot_has_materialized_run(
+    db: Any,
+    slot: _CriticalScheduledSlot,
+) -> bool:
+    if db is None or not hasattr(db, "raw_conn"):
+        return False
+    async with db.raw_conn() as conn:
+        cur = await conn.execute(
+            """
+            SELECT status
+            FROM ops_run
+            WHERE kind = ?
+              AND trigger = 'scheduled'
+              AND started_at >= ?
+              AND started_at < ?
+              AND status NOT IN ('skipped', 'crashed')
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            """,
+            (
+                slot.kind,
+                _utc_sql_text(slot.scheduled_utc),
+                _utc_sql_text(slot.next_scheduled_utc),
+            ),
+        )
+        row = await cur.fetchone()
+    return bool(row)
+
+
+async def _dispatch_critical_scheduled_slot(
+    db: Any,
+    bot: Any,
+    slot: _CriticalScheduledSlot,
+    *,
+    source: str,
+) -> bool:
+    memory_key = slot.slot_key
+    if memory_key in _critical_catchup_inflight or memory_key in _critical_catchup_completed:
+        return False
+    _critical_catchup_inflight.add(memory_key)
+    run_id = (
+        f"{source}_{slot.kind}_{slot.scheduled_utc.strftime('%Y%m%dT%H%M%SZ')}_"
+        f"{uuid4().hex[:8]}"
+    )
+    try:
+        if await _critical_slot_has_materialized_run(db, slot):
+            return False
+        logging.error(
+            "SCHED %s dispatching missed %s slot scheduled_local=%s scheduled_utc=%s now_utc=%s",
+            source,
+            slot.kind,
+            slot.scheduled_local.isoformat(),
+            slot.scheduled_utc.isoformat(),
+            datetime.now(timezone.utc).isoformat(),
+        )
+        if slot.kind == "tg_monitoring":
+            from source_parsing.telegram.service import telegram_monitor_scheduler
+
+            scheduler_func = telegram_monitor_scheduler
+        elif slot.kind == "vk_auto_import":
+            from vk_auto_queue import vk_auto_import_scheduler
+
+            scheduler_func = vk_auto_import_scheduler
+        else:
+            logging.warning("SCHED %s unknown critical slot kind=%s", source, slot.kind)
+            return False
+
+        async with heavy_operation(
+            kind=slot.kind,
+            trigger="scheduled",
+            mode="wait",
+            run_id=run_id,
+            operator_id=0,
+        ):
+            await scheduler_func(db, bot, run_id=run_id)
+        _critical_catchup_completed.add(memory_key)
+        return True
+    finally:
+        _critical_catchup_inflight.discard(memory_key)
+
+
+async def _maybe_catch_up_critical_scheduled_jobs_on_startup(db: Any, bot: Any) -> int:
+    dispatched = 0
+    for slot in _critical_due_slots(startup=True):
+        if await _dispatch_critical_scheduled_slot(
+            db,
+            bot,
+            slot,
+            source="startup_catchup",
+        ):
+            dispatched += 1
+    return dispatched
+
+
+async def maybe_dispatch_critical_scheduler_watchdog(db: Any, bot: Any) -> int:
+    dispatched = 0
+    for slot in _critical_due_slots(startup=False):
+        if await _dispatch_critical_scheduled_slot(
+            db,
+            bot,
+            slot,
+            source="watchdog",
+        ):
+            dispatched += 1
+    return dispatched
+
+
+def runtime_health_status() -> dict[str, Any]:
+    enabled, _, _, _, _ = _video_tomorrow_schedule_settings()
+    critical_specs = _critical_schedule_specs()
+    scheduler = _scheduler
+    payload: dict[str, Any] = {
+        "scheduler": "missing" if scheduler is None else "unknown",
+        "video_tomorrow": "disabled",
+    }
+    for spec in critical_specs:
+        payload[str(spec["kind"])] = "missing_scheduler" if scheduler is None else "unknown"
+    if scheduler is None:
+        if enabled:
+            payload["video_tomorrow"] = "missing_scheduler"
+        return payload
+
+    try:
+        running = bool(getattr(scheduler, "running"))
+    except Exception:
+        running = False
+    payload["scheduler"] = "ok" if running else "stopped"
+
+    for spec in critical_specs:
+        kind = str(spec["kind"])
+        job_prefix = str(spec["job_id"])
+        try:
+            if kind == "vk_auto_import":
+                jobs = [job for job in scheduler.get_jobs() if str(getattr(job, "id", "")).startswith(job_prefix)]
+            else:
+                job = scheduler.get_job(job_prefix)
+                jobs = [job] if job is not None else []
+        except Exception:
+            payload[kind] = "lookup_error"
+            continue
+        if not jobs:
+            payload[kind] = "missing"
+            continue
+        next_runs = [_job_next_run(job) for job in jobs if job is not None]
+        payload[kind] = "ok" if any(next_runs) else "missing_next_run"
+        serialized_next_runs = [
+            next_run.isoformat() if hasattr(next_run, "isoformat") else str(next_run)
+            for next_run in next_runs
+            if next_run is not None
+        ]
+        if serialized_next_runs:
+            payload[f"{kind}_next_run"] = min(serialized_next_runs)
+
+    if not enabled:
+        return payload
+
+    try:
+        job = scheduler.get_job("video_tomorrow")
+    except Exception:
+        payload["video_tomorrow"] = "lookup_error"
+        return payload
+    if job is None:
+        payload["video_tomorrow"] = "missing"
+        return payload
+    next_run = _job_next_run(job)
+    payload["video_tomorrow"] = "ok" if next_run is not None else "missing_next_run"
+    if next_run is not None:
+        payload["video_tomorrow_next_run"] = (
+            next_run.isoformat() if hasattr(next_run, "isoformat") else str(next_run)
+        )
+    return payload
 
 
 class BatchProgress:
@@ -337,14 +1257,116 @@ def schedule_event_batch(
 
 _scheduler: AsyncIOScheduler | None = None
 _run_meta: dict[str, tuple[str, float]] = {}
+_heavy_job_lock = asyncio.Lock()
+_critical_catchup_inflight: set[str] = set()
+_critical_catchup_completed: set[str] = set()
+_VIDEO_TOMORROW_EXISTING_SESSION_STATUSES: set[str] = {
+    "RENDERING",
+    "DONE",
+    "PUBLISHED_TEST",
+    "PUBLISHED_MAIN",
+}
+
+# Jobs that can take minutes/hours (Kaggle/LLM/rendering) and should not overlap in prod.
+_HEAVY_JOB_IDS: set[str] = {
+    "tg_monitoring",
+    "vk_auto_import",
+    "source_parsing",
+    "source_parsing_day",
+    "festival_queue",
+    "3di_scheduler",
+    "nightly_page_sync",
+    "telegraph_cache_sanitize",
+}
+
+_OPS_RUN_KIND_BY_JOB_ID: dict[str, str] = {
+    "3di_scheduler": "3di",
+    "source_parsing": "parse",
+    "source_parsing_day": "parse",
+}
+
+
+def _ops_run_kind_for_job(job_id: str) -> str:
+    return _OPS_RUN_KIND_BY_JOB_ID.get(job_id, job_id)
+
+
+async def _record_scheduler_skip(
+    db_obj: Any,
+    *,
+    job_id: str,
+    run_id: str | None,
+    reason: str,
+    blocked_by: Any | None = None,
+) -> None:
+    if db_obj is None or not hasattr(db_obj, "raw_conn"):
+        return
+    details: dict[str, Any] = {
+        "run_id": run_id,
+        "skip_reason": str(reason or "").strip() or "unknown",
+        "scheduler_job_id": str(job_id or "").strip() or "scheduler_job",
+    }
+    blocked_kind = str(getattr(blocked_by, "kind", "") or "").strip()
+    blocked_trigger = str(getattr(blocked_by, "trigger", "") or "").strip()
+    if blocked_kind:
+        details["blocked_by_kind"] = blocked_kind
+    if blocked_trigger:
+        details["blocked_by_trigger"] = blocked_trigger
+    try:
+        ops_run_id = await start_ops_run(
+            db_obj,
+            kind=_ops_run_kind_for_job(job_id),
+            trigger="scheduled",
+            operator_id=0,
+            details=details,
+        )
+        await finish_ops_run(
+            db_obj,
+            run_id=ops_run_id,
+            status="skipped",
+            details=details,
+        )
+    except Exception:
+        logging.warning("SCHED failed to record skipped ops_run job_id=%s", job_id, exc_info=True)
 
 
 def _job_next_run(job):
     return getattr(job, "next_run_time", None) or getattr(job, "next_run_at", None)
 
 
-def _job_wrapper(job_id: str, func):
-    async def _run(*args):
+def _job_wrapper(
+    job_id: str,
+    func,
+    *,
+    notify_skip: Callable[[str, str], None] | None = None,
+    default_guard_mode: str | None = None,
+):
+    async def _run(*args, **kwargs):
+        serialize_heavy = (os.getenv("SCHED_SERIALIZE_HEAVY_JOBS") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        is_heavy = job_id in _HEAVY_JOB_IDS
+        guard_mode_raw = (os.getenv("SCHED_HEAVY_GUARD_MODE") or "").strip().lower()
+        if guard_mode_raw in {"0", "off", "false", "no", "disable", "disabled"}:
+            guard_mode = "off"
+        elif guard_mode_raw in {"wait", "block", "serialize"}:
+            guard_mode = "wait"
+        elif guard_mode_raw in {"skip", "try", "nonblocking", "non-blocking"}:
+            guard_mode = "skip"
+        elif (default_guard_mode or "").strip().lower() in {"wait", "block", "serialize"}:
+            guard_mode = "wait"
+        elif (default_guard_mode or "").strip().lower() in {"skip", "try", "nonblocking", "non-blocking"}:
+            guard_mode = "skip"
+        else:
+            # Backwards-compatible default: old "serialize" mode implies waiting.
+            guard_mode = "wait" if serialize_heavy else "skip"
+        timeout_raw = (os.getenv("SCHED_HEAVY_TRY_TIMEOUT_SEC") or "0.2").strip()
+        try:
+            guard_timeout = max(0.0, float(timeout_raw))
+        except ValueError:
+            guard_timeout = 0.2
         run_id, start = _run_meta.get(job_id, (uuid4().hex, _time.perf_counter()))
         done = asyncio.Event()
 
@@ -359,12 +1381,63 @@ def _job_wrapper(job_id: str, func):
                     took_ms,
                 )
 
-        hb_task = asyncio.create_task(heartbeat())
-        try:
-            return await func(*args, run_id=run_id)
-        finally:
-            done.set()
-            hb_task.cancel()
+        async def _execute():
+            hb_task = asyncio.create_task(heartbeat())
+            try:
+                return await func(*args, run_id=run_id, **kwargs)
+            finally:
+                done.set()
+                hb_task.cancel()
+
+        async def _run_guarded():
+            if not is_heavy or guard_mode == "off":
+                return await _execute()
+
+            if guard_mode == "skip":
+                async with heavy_operation(
+                    kind=job_id,
+                    trigger="scheduled",
+                    mode="try",
+                    timeout_sec=guard_timeout,
+                    run_id=run_id,
+                    operator_id=0,
+                ) as acquired:
+                    if not acquired:
+                        meta = current_heavy_meta()
+                        meta_txt = describe_heavy_meta(meta)
+                        await _record_scheduler_skip(
+                            args[0] if args else None,
+                            job_id=job_id,
+                            run_id=run_id,
+                            reason="heavy_busy",
+                            blocked_by=meta,
+                        )
+                        logging.info(
+                            "job_skip_heavy_busy job_id=%s run_id=%s current=%s",
+                            job_id,
+                            run_id,
+                            meta_txt,
+                        )
+                        if notify_skip:
+                            notify_skip(job_id, f"идёт другая тяжёлая операция: {meta_txt}")
+                        return None
+                    return await _execute()
+
+            async with heavy_operation(
+                kind=job_id,
+                trigger="scheduled",
+                mode="wait",
+                run_id=run_id,
+                operator_id=0,
+            ):
+                return await _execute()
+
+        if serialize_heavy and is_heavy:
+            if _heavy_job_lock.locked():
+                logging.info("job_wait_heavy_lock job_id=%s run_id=%s", job_id, run_id)
+            async with _heavy_job_lock:
+                return await _run_guarded()
+        return await _run_guarded()
 
     return _run
 
@@ -441,7 +1514,29 @@ def startup(
             }
         )
 
+    is_prod = os.getenv("DEV_MODE") != "1" and os.getenv("PYTEST_CURRENT_TEST") is None
+
     main_module = None
+
+    async def _notify_admin_skip_async(job_name: str, reason: str) -> None:
+        chat_id = await resolve_superadmin_chat_id(db)
+        if not chat_id:
+            return
+        if bot is None or not hasattr(bot, "send_message"):
+            return
+        text = f"⚠️ SCHED: пропуск {job_name}. Причина: {reason}"
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            logging.exception("SCHED failed to notify admin chat")
+
+    def _notify_admin_skip(job_name: str, reason: str) -> None:
+        try:
+            asyncio.create_task(_notify_admin_skip_async(job_name, reason))
+        except RuntimeError:
+            logging.warning("SCHED failed to notify admin: no running event loop")
+        except Exception:
+            logging.exception("SCHED failed to notify admin chat")
 
     def resolve(name: str, value):
         nonlocal main_module
@@ -476,134 +1571,694 @@ def startup(
         else nightly_page_sync
     )
 
-    job = _scheduler.add_job(
-        _job_wrapper("vk_scheduler", vk_scheduler),
-        "cron",
-        id="vk_scheduler",
-        minute="1,16,31,46",
-        args=[db, bot],
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=30,
-    )
-    logging.info(
-        "SCHED registered job id=%s next_run=%s", job.id, _job_next_run(job)
-    )
-    job = _scheduler.add_job(
-        _job_wrapper("vk_poll_scheduler", vk_poll_scheduler),
-        "cron",
-        id="vk_poll_scheduler",
-        minute="2,17,32,47",
-        args=[db, bot],
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=30,
-    )
-    logging.info(
-        "SCHED registered job id=%s next_run=%s", job.id, _job_next_run(job)
-    )
-    job = _scheduler.add_job(
-        _job_wrapper("cleanup_scheduler", cleanup_scheduler),
-        "cron",
-        id="cleanup_scheduler",
-        hour="2",
-        minute="7",
-        args=[db, bot],
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=30,
-    )
-    logging.info(
-        "SCHED registered job id=%s next_run=%s", job.id, _job_next_run(job)
-    )
-    job = _scheduler.add_job(
-        _job_wrapper("partner_notification_scheduler", partner_notification_scheduler),
-        "cron",
-        id="partner_notification_scheduler",
-        minute="5",
-        args=[db, bot],
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=30,
-    )
-    logging.info(
-        "SCHED registered job id=%s next_run=%s", job.id, _job_next_run(job)
-    )
-
-    job = _scheduler.add_job(
-        _job_wrapper("fest_nav_rebuild", rebuild_fest_nav_if_changed),
-        "cron",
-        id="fest_nav_rebuild",
-        hour="3",
-        minute="0",
-        args=[db],
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=30,
-    )
-    logging.info(
-        "SCHED registered job id=%s next_run=%s", job.id, _job_next_run(job)
-    )
-
-    times_raw = os.getenv(
-        "VK_CRAWL_TIMES_LOCAL", "05:15,09:15,13:15,17:15,21:15,22:45"
-    )
-    tz_name = os.getenv("VK_CRAWL_TZ", "Europe/Kaliningrad")
-    tz = ZoneInfo(tz_name)
-    for idx, t in enumerate(times_raw.split(",")):
-        t = t.strip()
-        if not t:
-            continue
+    def _register_job(job_id: str, *args, **kwargs):
         try:
-            hh, mm = map(int, t.split(":"))
-        except ValueError:
-            logging.warning("invalid VK_CRAWL_TIMES_LOCAL entry: %s", t)
-            continue
-        now_local = datetime.now(tz).replace(hour=hh, minute=mm, second=0, microsecond=0)
-        now_utc = now_local.astimezone(timezone.utc)
-        job = _scheduler.add_job(
-            _job_wrapper("vk_crawl_cron", vk_crawl_cron),
+            job = _scheduler.add_job(*args, **kwargs)
+        except Exception:
+            logging.exception("SCHED failed to register job id=%s", job_id)
+            return None
+        logging.info(
+            "SCHED registered job id=%s next_run=%s", job.id, _job_next_run(job)
+        )
+        return job
+
+    enable_core_schedulers = _env_enabled("ENABLE_CORE_SCHEDULERS", default=True)
+    if enable_core_schedulers:
+        _register_job(
+            "vk_scheduler",
+            _job_wrapper("vk_scheduler", vk_scheduler, notify_skip=_notify_admin_skip),
             "cron",
-            id=f"vk_crawl_cron_{idx}",
-            hour=str(now_utc.hour),
-            minute=str(now_utc.minute),
+            id="vk_scheduler",
+            minute="1,16,31,46",
             args=[db, bot],
             replace_existing=True,
             max_instances=1,
             coalesce=True,
             misfire_grace_time=30,
         )
-        logging.info(
-            "SCHED registered job id=%s next_run=%s", job.id, _job_next_run(job)
+        _register_job(
+            "vk_poll_scheduler",
+            _job_wrapper(
+                "vk_poll_scheduler", vk_poll_scheduler, notify_skip=_notify_admin_skip
+            ),
+            "cron",
+            id="vk_poll_scheduler",
+            minute="2,17,32,47",
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
         )
+        _register_job(
+            "cleanup_scheduler",
+            _job_wrapper("cleanup_scheduler", cleanup_scheduler, notify_skip=_notify_admin_skip),
+            "cron",
+            id="cleanup_scheduler",
+            hour="2",
+            minute="7",
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+        _register_job(
+            "partner_notification_scheduler",
+            _job_wrapper(
+                "partner_notification_scheduler",
+                partner_notification_scheduler,
+                notify_skip=_notify_admin_skip,
+            ),
+            "cron",
+            id="partner_notification_scheduler",
+            minute="5",
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+        _register_job(
+            "fest_nav_rebuild",
+            _job_wrapper(
+                "fest_nav_rebuild",
+                rebuild_fest_nav_if_changed,
+                notify_skip=_notify_admin_skip,
+            ),
+            "cron",
+            id="fest_nav_rebuild",
+            hour="3",
+            minute="0",
+            args=[db],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+
+        times_raw = os.getenv(
+            "VK_CRAWL_TIMES_LOCAL", "05:15,09:15,13:15,17:15,21:15,22:45"
+        )
+        tz_name = os.getenv("VK_CRAWL_TZ", "Europe/Kaliningrad")
+        tz = _safe_zoneinfo(tz_name, label="VK_CRAWL_TZ")
+        for idx, t in enumerate(times_raw.split(",")):
+            t = t.strip()
+            if not t:
+                continue
+            try:
+                hh, mm = map(int, t.split(":"))
+            except ValueError:
+                logging.warning("invalid VK_CRAWL_TIMES_LOCAL entry: %s", t)
+                continue
+            now_local = datetime.now(tz).replace(hour=hh, minute=mm, second=0, microsecond=0)
+            now_utc = now_local.astimezone(timezone.utc)
+            _register_job(
+                f"vk_crawl_cron_{idx}",
+                _job_wrapper(
+                    "vk_crawl_cron", vk_crawl_cron, notify_skip=_notify_admin_skip
+                ),
+                "cron",
+                id=f"vk_crawl_cron_{idx}",
+                hour=str(now_utc.hour),
+                minute=str(now_utc.minute),
+                args=[db, bot],
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
+            )
+    else:
+        logging.info("SCHED skipping core schedulers (ENABLE_CORE_SCHEDULERS!=1)")
 
     # Source parsing from theatres (before daily announcement at 08:00)
-    if os.getenv("ENABLE_SOURCE_PARSING") == "1":
+    enable_source_parsing = _env_enabled("ENABLE_SOURCE_PARSING", default=is_prod)
+    if enable_source_parsing:
         from source_parsing.commands import source_parsing_scheduler
-        job = _scheduler.add_job(
-            _job_wrapper("source_parsing", source_parsing_scheduler),
+        parsing_time_raw = os.getenv("SOURCE_PARSING_TIME_LOCAL", "04:30").strip()
+        parsing_tz_name = os.getenv("SOURCE_PARSING_TZ", "Europe/Kaliningrad")
+        parsing_hour, parsing_minute = _cron_from_local(
+            parsing_time_raw,
+            parsing_tz_name,
+            default_hour="4",
+            default_minute="30",
+            label="SOURCE_PARSING_TIME_LOCAL",
+        )
+        _register_job(
+            "source_parsing",
+            _job_wrapper("source_parsing", source_parsing_scheduler, notify_skip=_notify_admin_skip),
             "cron",
             id="source_parsing",
-            hour="2",
-            minute="0",
+            hour=parsing_hour,
+            minute=parsing_minute,
             args=[db, bot],
             replace_existing=True,
             max_instances=1,
             coalesce=True,
             misfire_grace_time=30,
         )
+    else:
+        logging.info("SCHED skipping source_parsing (ENABLE_SOURCE_PARSING!=1)")
+        _notify_admin_skip("source_parsing", "ENABLE_SOURCE_PARSING!=1")
+
+    enable_source_parsing_day = _env_enabled("ENABLE_SOURCE_PARSING_DAY", default=is_prod)
+    if enable_source_parsing_day:
+        from source_parsing.commands import source_parsing_scheduler_if_changed
+        day_time_raw = os.getenv("SOURCE_PARSING_DAY_TIME_LOCAL", "14:15").strip()
+        day_tz_name = os.getenv("SOURCE_PARSING_DAY_TZ", "Europe/Kaliningrad")
+        day_hour, day_minute = _cron_from_local(
+            day_time_raw,
+            day_tz_name,
+            default_hour="12",
+            default_minute="15",
+            label="SOURCE_PARSING_DAY_TIME_LOCAL",
+        )
+        _register_job(
+            "source_parsing_day",
+            _job_wrapper("source_parsing_day", source_parsing_scheduler_if_changed, notify_skip=_notify_admin_skip),
+            "cron",
+            id="source_parsing_day",
+            hour=day_hour,
+            minute=day_minute,
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+    else:
+        logging.info("SCHED skipping source_parsing_day (ENABLE_SOURCE_PARSING_DAY!=1)")
+        _notify_admin_skip("source_parsing_day", "ENABLE_SOURCE_PARSING_DAY!=1")
+
+    enable_tg_monitoring = _env_enabled("ENABLE_TG_MONITORING", default=is_prod)
+    if enable_tg_monitoring:
+        from source_parsing.telegram.service import telegram_monitor_scheduler
+        tg_time_raw = os.getenv("TG_MONITORING_TIME_LOCAL", "23:40").strip()
+        tg_tz_name = os.getenv("TG_MONITORING_TZ", "Europe/Kaliningrad")
+        tg_hour, tg_minute = _cron_from_local(
+            tg_time_raw,
+            tg_tz_name,
+            default_hour="23",
+            default_minute="40",
+            label="TG_MONITORING_TIME_LOCAL",
+        )
+        _register_job(
+            "tg_monitoring",
+            _job_wrapper(
+                "tg_monitoring",
+                telegram_monitor_scheduler,
+                notify_skip=_notify_admin_skip,
+                default_guard_mode="wait",
+            ),
+            "cron",
+            id="tg_monitoring",
+            hour=tg_hour,
+            minute=tg_minute,
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=_critical_job_misfire_grace_seconds("tg_monitoring"),
+        )
+    else:
+        logging.info("SCHED skipping tg_monitoring (ENABLE_TG_MONITORING!=1)")
+        _notify_admin_skip("tg_monitoring", "ENABLE_TG_MONITORING!=1")
+
+    enable_vk_auto_import = _env_enabled("ENABLE_VK_AUTO_IMPORT", default=False)
+    if enable_vk_auto_import:
+        from vk_auto_queue import vk_auto_import_scheduler
+
+        vk_auto_times = os.getenv(
+            "VK_AUTO_IMPORT_TIMES_LOCAL", "06:15,10:15,12:00,18:30"
+        ).strip()
+        vk_auto_tz = os.getenv("VK_AUTO_IMPORT_TZ", "Europe/Kaliningrad").strip()
+        for idx, t in enumerate(vk_auto_times.split(",")):
+            t = t.strip()
+            if not t:
+                continue
+            hour, minute = _cron_from_local(
+                t,
+                vk_auto_tz,
+                default_hour="6",
+                default_minute="30",
+                label="VK_AUTO_IMPORT_TIMES_LOCAL",
+            )
+            _register_job(
+                f"vk_auto_import_{idx}",
+                _job_wrapper(
+                    "vk_auto_import",
+                    vk_auto_import_scheduler,
+                    notify_skip=_notify_admin_skip,
+                    default_guard_mode="wait",
+                ),
+                "cron",
+                id=f"vk_auto_import_{idx}",
+                hour=hour,
+                minute=minute,
+                args=[db, bot],
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=_critical_job_misfire_grace_seconds("vk_auto_import"),
+            )
+    else:
+        logging.info("SCHED skipping vk_auto_import (ENABLE_VK_AUTO_IMPORT!=1)")
+        _notify_admin_skip("vk_auto_import", "ENABLE_VK_AUTO_IMPORT!=1")
+
+    enable_festival_queue = _env_enabled("ENABLE_FESTIVAL_QUEUE", default=False)
+    if enable_festival_queue:
+        from festival_queue import process_festival_queue
+
+        async def festival_queue_scheduler(
+            db_obj,
+            bot_obj,
+            *,
+            run_id: str | None = None,
+        ) -> None:
+            limit_raw = (os.getenv("FESTIVAL_QUEUE_LIMIT") or "").strip()
+            limit: int | None = None
+            if limit_raw:
+                try:
+                    parsed_limit = int(limit_raw)
+                    if parsed_limit > 0:
+                        limit = parsed_limit
+                except ValueError:
+                    logging.warning("invalid FESTIVAL_QUEUE_LIMIT=%r; using no limit", limit_raw)
+            admin_chat_id = await resolve_superadmin_chat_id(db_obj)
+            report = await process_festival_queue(
+                db_obj,
+                bot=bot_obj,
+                chat_id=admin_chat_id,
+                limit=limit,
+                trigger="scheduled",
+                operator_id=0,
+                run_id=run_id,
+            )
+            logging.info(
+                "festival_queue_scheduler processed=%s success=%s failed=%s skipped=%s",
+                report.processed,
+                report.success,
+                report.failed,
+                report.skipped,
+            )
+
+        fest_queue_times = os.getenv("FESTIVAL_QUEUE_TIMES_LOCAL", "03:30,16:30").strip()
+        fest_queue_tz = os.getenv("FESTIVAL_QUEUE_TZ", "Europe/Kaliningrad").strip()
+        for idx, t in enumerate(fest_queue_times.split(",")):
+            t = t.strip()
+            if not t:
+                continue
+            hour, minute = _cron_from_local(
+                t,
+                fest_queue_tz,
+                default_hour="3",
+                default_minute="30",
+                label="FESTIVAL_QUEUE_TIMES_LOCAL",
+            )
+            _register_job(
+                f"festival_queue_{idx}",
+                _job_wrapper("festival_queue", festival_queue_scheduler, notify_skip=_notify_admin_skip),
+                "cron",
+                id=f"festival_queue_{idx}",
+                hour=hour,
+                minute=minute,
+                args=[db, bot],
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
+            )
+    else:
+        logging.info("SCHED skipping festival_queue (ENABLE_FESTIVAL_QUEUE!=1)")
+        _notify_admin_skip("festival_queue", "ENABLE_FESTIVAL_QUEUE!=1")
+
+    enable_ticket_sites_queue = _env_enabled("ENABLE_TICKET_SITES_QUEUE", default=False)
+    if enable_ticket_sites_queue:
+        from ticket_sites_queue import process_ticket_sites_queue
+
+        async def ticket_sites_queue_scheduler(
+            db_obj,
+            bot_obj,
+            *,
+            run_id: str | None = None,
+        ) -> None:
+            limit_raw = (os.getenv("TICKET_SITES_QUEUE_LIMIT") or "").strip()
+            limit: int | None = None
+            if limit_raw:
+                try:
+                    parsed_limit = int(limit_raw)
+                    if parsed_limit > 0:
+                        limit = parsed_limit
+                except ValueError:
+                    logging.warning("invalid TICKET_SITES_QUEUE_LIMIT=%r; using default", limit_raw)
+            admin_chat_id = await resolve_superadmin_chat_id(db_obj)
+            report = await process_ticket_sites_queue(
+                db_obj,
+                bot=bot_obj,
+                chat_id=admin_chat_id,
+                limit=limit,
+                trigger="scheduled",
+                operator_id=0,
+                run_id=run_id,
+            )
+            logging.info(
+                "ticket_sites_queue_scheduler processed=%s success=%s failed=%s skipped=%s",
+                report.processed,
+                report.success,
+                report.failed,
+                report.skipped,
+            )
+
+        t_time_raw = os.getenv("TICKET_SITES_QUEUE_TIME_LOCAL", "11:20").strip()
+        t_tz_name = os.getenv("TICKET_SITES_QUEUE_TZ", "Europe/Kaliningrad").strip()
+        t_hour, t_minute = _cron_from_local(
+            t_time_raw,
+            t_tz_name,
+            default_hour="9",
+            default_minute="20",
+            label="TICKET_SITES_QUEUE_TIME_LOCAL",
+        )
+        _register_job(
+            "ticket_sites_queue",
+            _job_wrapper("ticket_sites_queue", ticket_sites_queue_scheduler, notify_skip=_notify_admin_skip),
+            "cron",
+            id="ticket_sites_queue",
+            hour=t_hour,
+            minute=t_minute,
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+    else:
+        logging.info("SCHED skipping ticket_sites_queue (ENABLE_TICKET_SITES_QUEUE!=1)")
+        _notify_admin_skip("ticket_sites_queue", "ENABLE_TICKET_SITES_QUEUE!=1")
+
+    enable_3di = _env_enabled("ENABLE_3DI_SCHEDULED", default=is_prod)
+    if enable_3di:
+        from preview_3d.handlers import run_3di_new_only_scheduler
+
+        async def preview_3di_scheduler(
+            db_obj,
+            bot_obj,
+            *,
+            run_id: str | None = None,
+        ) -> None:
+            run_chat_id = await resolve_superadmin_chat_id(db_obj)
+            await run_3di_new_only_scheduler(
+                db_obj,
+                bot_obj,
+                chat_id=run_chat_id,
+                run_id=run_id,
+            )
+
+        three_di_times = os.getenv("THREEDI_TIMES_LOCAL", "07:15,15:15,17:15")
+        three_di_tz = os.getenv("THREEDI_TZ", "Europe/Kaliningrad")
+        for idx, t in enumerate(three_di_times.split(",")):
+            t = t.strip()
+            if not t:
+                continue
+            hour, minute = _cron_from_local(
+                t,
+                three_di_tz,
+                default_hour="7",
+                default_minute="15",
+                label="THREEDI_TIMES_LOCAL",
+            )
+            _register_job(
+                f"3di_scheduler_{idx}",
+                _job_wrapper("3di_scheduler", preview_3di_scheduler, notify_skip=_notify_admin_skip),
+                "cron",
+                id=f"3di_scheduler_{idx}",
+                hour=hour,
+                minute=minute,
+                args=[db, bot],
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
+            )
+    else:
+        logging.info("SCHED skipping 3di_scheduler (ENABLE_3DI_SCHEDULED!=1)")
+        _notify_admin_skip("3di_scheduler", "ENABLE_3DI_SCHEDULED!=1")
+
+    enable_guide_excursions = _env_enabled("ENABLE_GUIDE_EXCURSIONS_SCHEDULED", default=False)
+    if enable_guide_excursions:
+        async def guide_excursions_scheduler(
+            db_obj,
+            bot_obj,
+            *,
+            mode: str,
+            run_id: str | None = None,
+        ) -> None:
+            await _run_scheduled_guide_excursions(
+                db_obj,
+                bot_obj,
+                mode=mode,
+            )
+
+        guide_tz_name = os.getenv("GUIDE_EXCURSIONS_TZ", "Europe/Kaliningrad").strip()
+        light_times = (os.getenv("GUIDE_EXCURSIONS_LIGHT_TIMES_LOCAL", "09:05,13:20") or "").split(",")
+        for idx, value in enumerate(light_times):
+            raw_time = value.strip()
+            if not raw_time:
+                continue
+            hour, minute = _cron_from_local(
+                raw_time,
+                guide_tz_name,
+                default_hour="9",
+                default_minute="5",
+                label="GUIDE_EXCURSIONS_LIGHT_TIMES_LOCAL",
+            )
+            _register_job(
+                f"guide_excursions_light_{idx}",
+                _job_wrapper("guide_excursions_light", guide_excursions_scheduler, notify_skip=_notify_admin_skip),
+                "cron",
+                id=f"guide_excursions_light_{idx}",
+                hour=hour,
+                minute=minute,
+                args=[db, bot],
+                kwargs={"mode": "light"},
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
+            )
+
+        full_time_raw = os.getenv("GUIDE_EXCURSIONS_FULL_TIME_LOCAL", "20:10").strip()
+        full_hour, full_minute = _cron_from_local(
+            full_time_raw,
+            guide_tz_name,
+            default_hour="20",
+            default_minute="10",
+            label="GUIDE_EXCURSIONS_FULL_TIME_LOCAL",
+        )
+        _register_job(
+            "guide_excursions_full",
+            _job_wrapper("guide_excursions_full", guide_excursions_scheduler, notify_skip=_notify_admin_skip),
+            "cron",
+            id="guide_excursions_full",
+            hour=full_hour,
+            minute=full_minute,
+            args=[db, bot],
+            kwargs={"mode": "full"},
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+    else:
+        logging.info("SCHED skipping guide_excursions (ENABLE_GUIDE_EXCURSIONS_SCHEDULED!=1)")
+        _notify_admin_skip("guide_excursions", "ENABLE_GUIDE_EXCURSIONS_SCHEDULED!=1")
+
+    enable_video_tomorrow, video_tz_name, video_time_raw, video_profile_key, video_test_mode = (
+        _video_tomorrow_schedule_settings()
+    )
+    if enable_video_tomorrow:
+        async def video_tomorrow_scheduler(
+            db_obj,
+            bot_obj,
+            *,
+            profile_key: str,
+            test_mode: bool,
+            run_id: str | None = None,
+        ) -> None:
+            await _run_scheduled_video_tomorrow(
+                db_obj,
+                bot_obj,
+                profile_key=profile_key,
+                test_mode=test_mode,
+            )
+
+        video_hour, video_minute = _cron_from_local(
+            video_time_raw,
+            video_tz_name,
+            default_hour="14",
+            default_minute="45",
+            label="V_TOMORROW_TIME_LOCAL",
+        )
+        _register_job(
+            "video_tomorrow",
+            _job_wrapper("video_tomorrow", video_tomorrow_scheduler, notify_skip=_notify_admin_skip),
+            "cron",
+            id="video_tomorrow",
+            hour=video_hour,
+            minute=video_minute,
+            args=[db, bot],
+            kwargs={"profile_key": video_profile_key, "test_mode": video_test_mode},
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=_video_tomorrow_misfire_grace_seconds(),
+        )
+    else:
         logging.info(
-            "SCHED registered job id=%s next_run=%s", job.id, _job_next_run(job)
+            "SCHED skipping video_tomorrow (ENABLE_V_TOMORROW_SCHEDULED!=1 and ENABLE_V_TEST_TOMORROW_SCHEDULED!=1)"
+        )
+        _notify_admin_skip(
+            "video_tomorrow",
+            "ENABLE_V_TOMORROW_SCHEDULED!=1 and ENABLE_V_TEST_TOMORROW_SCHEDULED!=1",
         )
 
+    enable_general_stats = _env_enabled("ENABLE_GENERAL_STATS", default=False)
+    if enable_general_stats:
+        from general_stats import general_stats_scheduler
+
+        general_stats_time_raw = os.getenv("GENERAL_STATS_TIME_LOCAL", "07:30").strip()
+        general_stats_tz_name = os.getenv("GENERAL_STATS_TZ", "Europe/Kaliningrad").strip()
+        general_stats_hour, general_stats_minute = _cron_from_local(
+            general_stats_time_raw,
+            general_stats_tz_name,
+            default_hour="5",
+            default_minute="30",
+            label="GENERAL_STATS_TIME_LOCAL",
+        )
+        _register_job(
+            "general_stats",
+            _job_wrapper("general_stats", general_stats_scheduler, notify_skip=_notify_admin_skip),
+            "cron",
+            id="general_stats",
+            hour=general_stats_hour,
+            minute=general_stats_minute,
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+    else:
+        logging.info("SCHED skipping general_stats (ENABLE_GENERAL_STATS!=1)")
+        _notify_admin_skip("general_stats", "ENABLE_GENERAL_STATS!=1")
+
+    enable_telegraph_cache = _env_enabled("ENABLE_TELEGRAPH_CACHE_SANITIZER", default=False)
+    if enable_telegraph_cache:
+        from telegraph_cache_sanitizer import run_telegraph_cache_sanitizer
+
+        async def telegraph_cache_sanitize_scheduler(
+            db_obj,
+            bot_obj,
+            *,
+            run_id: str | None = None,
+        ) -> None:
+            admin_chat_id = await resolve_superadmin_chat_id(db_obj)
+            res = await run_telegraph_cache_sanitizer(
+                db_obj,
+                bot=bot_obj,
+                chat_id=admin_chat_id,
+                operator_id=0,
+                trigger="scheduled",
+                run_id=run_id,
+            )
+            imported = res.get("imported") or {}
+            regen = res.get("regen") or {}
+            logging.info(
+                "telegraph_cache_sanitize_scheduler total=%s ok=%s fail=%s regen=%s",
+                imported.get("total"),
+                imported.get("ok"),
+                imported.get("fail"),
+                regen,
+            )
+            if admin_chat_id and bot_obj is not None:
+                try:
+                    text = (
+                        "🧼 Telegraph cache sanitizer (scheduled): готово\n"
+                        f"ok={imported.get('ok', 0)} fail={imported.get('fail', 0)} total={imported.get('total', 0)}\n"
+                        + (
+                            (
+                                "regen: "
+                                + ", ".join(
+                                    f"{k}={int(v)}"
+                                    for k, v in regen.items()
+                                    if int(v or 0) > 0
+                                )
+                            )
+                            if regen
+                            else ""
+                        )
+                    ).strip()
+                    await bot_obj.send_message(admin_chat_id, text, disable_web_page_preview=True)
+                except Exception:
+                    logging.warning("telegraph_cache_sanitize_scheduler notify failed", exc_info=True)
+
+        cache_time_raw = os.getenv("TELEGRAPH_CACHE_TIME_LOCAL", "01:10").strip()
+        cache_tz_name = os.getenv("TELEGRAPH_CACHE_TZ", "Europe/Kaliningrad").strip() or "Europe/Kaliningrad"
+        cache_hour, cache_minute = _cron_from_local(
+            cache_time_raw,
+            cache_tz_name,
+            default_hour="23",
+            default_minute="10",
+            label="TELEGRAPH_CACHE_TIME_LOCAL",
+        )
+        _register_job(
+            "telegraph_cache_sanitize",
+            _job_wrapper(
+                "telegraph_cache_sanitize",
+                telegraph_cache_sanitize_scheduler,
+                notify_skip=_notify_admin_skip,
+            ),
+            "cron",
+            id="telegraph_cache_sanitize",
+            hour=cache_hour,
+            minute=cache_minute,
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+    else:
+        logging.info("SCHED skipping telegraph_cache_sanitize (ENABLE_TELEGRAPH_CACHE_SANITIZER!=1)")
+        _notify_admin_skip("telegraph_cache_sanitize", "ENABLE_TELEGRAPH_CACHE_SANITIZER!=1")
+
+    enable_kaggle_recovery = _env_enabled("ENABLE_KAGGLE_RECOVERY", default=is_prod)
+    if enable_kaggle_recovery:
+        from kaggle_recovery import kaggle_recovery_scheduler
+        interval_raw = os.getenv("KAGGLE_RECOVERY_INTERVAL_MINUTES", "5").strip()
+        try:
+            interval_min = max(1, int(interval_raw))
+        except ValueError:
+            interval_min = 5
+        _register_job(
+            "kaggle_recovery",
+            _job_wrapper("kaggle_recovery", kaggle_recovery_scheduler, notify_skip=_notify_admin_skip),
+            "interval",
+            id="kaggle_recovery",
+            minutes=interval_min,
+            args=[db, bot],
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+    else:
+        logging.info("SCHED skipping kaggle_recovery (ENABLE_KAGGLE_RECOVERY!=1)")
+        _notify_admin_skip("kaggle_recovery", "ENABLE_KAGGLE_RECOVERY!=1")
+
     if os.getenv("ENABLE_NIGHTLY_PAGE_SYNC") == "1":
-        job = _scheduler.add_job(
-            _job_wrapper("nightly_page_sync", nightly_page_sync),
+        _register_job(
+            "nightly_page_sync",
+            _job_wrapper("nightly_page_sync", nightly_page_sync, notify_skip=_notify_admin_skip),
             "cron",
             id="nightly_page_sync",
             hour="2",
@@ -614,11 +2269,28 @@ def startup(
             coalesce=True,
             misfire_grace_time=30,
         )
-        logging.info(
-            "SCHED registered job id=%s next_run=%s",
-            job.id,
-            _job_next_run(job),
-        )
+    else:
+        logging.info("SCHED skipping nightly_page_sync (ENABLE_NIGHTLY_PAGE_SYNC!=1)")
+
+    # Pinned button update at 18:00 Kaliningrad time (UTC+2 = 16:00 UTC)
+    from handlers.pinned_button import pinned_button_scheduler
+    
+    pinned_tz = _safe_zoneinfo("Europe/Kaliningrad", label="PINNED_BUTTON_TZ")
+    pinned_local = datetime.now(pinned_tz).replace(hour=18, minute=0, second=0, microsecond=0)
+    pinned_utc = pinned_local.astimezone(timezone.utc)
+    _register_job(
+        "pinned_button_scheduler",
+        _job_wrapper("pinned_button_scheduler", pinned_button_scheduler, notify_skip=_notify_admin_skip),
+        "cron",
+        id="pinned_button_scheduler",
+        hour=str(pinned_utc.hour),
+        minute=str(pinned_utc.minute),
+        args=[db, bot],
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
+    )
 
     async def _run_maintenance(job, name: str, timeout: float, run_id: str | None = None) -> None:
         start = _time.perf_counter()
@@ -634,8 +2306,14 @@ def startup(
             logging.warning("db_maintenance %s failed", name, exc_info=True)
 
     if db is not None:
-        _scheduler.add_job(
-            _job_wrapper("db_optimize", _run_maintenance),
+        try:
+            from source_parsing.post_metrics import cleanup_post_metrics
+        except Exception:
+            cleanup_post_metrics = None  # type: ignore[assignment]
+
+        _register_job(
+            "db_optimize",
+            _job_wrapper("db_optimize", _run_maintenance, notify_skip=_notify_admin_skip),
             "interval",
             id="db_optimize",
             hours=1,
@@ -645,8 +2323,9 @@ def startup(
             coalesce=True,
             misfire_grace_time=30,
         )
-        _scheduler.add_job(
-            _job_wrapper("db_wal_checkpoint", _run_maintenance),
+        _register_job(
+            "db_wal_checkpoint",
+            _job_wrapper("db_wal_checkpoint", _run_maintenance, notify_skip=_notify_admin_skip),
             "interval",
             id="db_wal_checkpoint",
             hours=1,
@@ -656,8 +2335,9 @@ def startup(
             coalesce=True,
             misfire_grace_time=30,
         )
-        _scheduler.add_job(
-            _job_wrapper("db_vacuum", _run_maintenance),
+        _register_job(
+            "db_vacuum",
+            _job_wrapper("db_vacuum", _run_maintenance, notify_skip=_notify_admin_skip),
             "interval",
             id="db_vacuum",
             hours=12,
@@ -667,12 +2347,34 @@ def startup(
             coalesce=True,
             misfire_grace_time=30,
         )
+        if cleanup_post_metrics is not None:
+            _register_job(
+                "post_metrics_cleanup",
+                _job_wrapper("post_metrics_cleanup", _run_maintenance, notify_skip=_notify_admin_skip),
+                "interval",
+                id="post_metrics_cleanup",
+                hours=24,
+                args=[partial(cleanup_post_metrics, db), "post_metrics_cleanup", 20.0],
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
+            )
 
     _scheduler.add_listener(
         _on_event,
         EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED,
     )
     _scheduler.start()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logging.warning("SCHED failed to schedule startup catchup for video_tomorrow: no running event loop")
+    except Exception:
+        logging.exception("SCHED failed to schedule startup catchup for video_tomorrow")
+    else:
+        loop.create_task(_maybe_catch_up_video_tomorrow_on_startup(db, bot))
+        loop.create_task(_maybe_catch_up_critical_scheduled_jobs_on_startup(db, bot))
     return _scheduler
 
 

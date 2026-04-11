@@ -150,7 +150,7 @@ def _normalize_location_key(value: str) -> str:
 
 @lru_cache(maxsize=1)
 def _load_known_locations() -> dict[str, tuple[str, str | None, str | None]]:
-    loc_path = os.path.join("docs", "LOCATIONS.md")
+    loc_path = os.path.join("docs", "reference", "locations.md")
     if not os.path.exists(loc_path):
         return {}
     mapping: dict[str, tuple[str, str | None, str | None]] = {}
@@ -258,16 +258,26 @@ def group_events_for_special(
         # Pick first event as "main" for description, photo, etc.
         main = event_list[0]
         
-        # Description: prefer non-empty description, else search_digest
+        # Description for list pages: prefer LLM short_description, else search_digest, else first sentence.
+        from digest_helper import clean_search_digest, clean_short_description, fallback_one_sentence
+
         description = ""
         for e in event_list:
-            if e.description and e.description.strip():
-                description = e.description.strip()
+            sd = clean_short_description(getattr(e, "short_description", None))
+            if sd:
+                description = sd
                 break
         if not description:
             for e in event_list:
-                if e.search_digest and e.search_digest.strip():
-                    description = e.search_digest.strip()
+                digest = clean_search_digest(getattr(e, "search_digest", None))
+                if digest:
+                    description = digest
+                    break
+        if not description:
+            for e in event_list:
+                sent = fallback_one_sentence(getattr(e, "description", None))
+                if sent:
+                    description = sent
                     break
         
         # Photo URL: prioritize 3D preview, then first valid photo
@@ -496,14 +506,20 @@ async def build_special_page_content(
     Returns:
         (page_title, content_nodes, content_size, used_days)
     """
-    from models import Event, Festival
+    from models import Event, Festival, WeekendPage
     ensure_event_telegraph_link = require_main_attr("ensure_event_telegraph_link")
     format_day_pretty = require_main_attr("format_day_pretty")
+    format_weekend_range = require_main_attr("format_weekend_range")
     build_month_nav_block = require_main_attr("build_month_nav_block")
     LOCAL_TZ = require_main_attr("LOCAL_TZ")
     from datetime import datetime
     
     original_days = days
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "build_special_page_content: start_date=%s, days=%d, title=%s",
+        start_date.isoformat(), days, title
+    )
     
     while days >= 1:
         end_date = start_date + timedelta(days=days - 1)
@@ -512,14 +528,28 @@ async def build_special_page_content(
             for i in range(days)
         ]
         
+        logger.info(
+            "build_special_page_content: querying events for date_range=%s",
+            date_range
+        )
+        
         # Fetch events
         async with db.get_session() as session:
             result = await session.execute(
                 select(Event)
-                .where(Event.date.in_(date_range))
+                .where(
+                    Event.date.in_(date_range),
+                    Event.lifecycle_status == "active",
+                    Event.silent.is_(False),
+                )
                 .order_by(Event.date, Event.time)
             )
             events = list(result.scalars().all())
+            
+            logger.info(
+                "build_special_page_content: found %d events for date_range",
+                len(events)
+            )
             
             # Fetch exhibitions that overlap with the period
             ex_result = await session.execute(
@@ -529,6 +559,8 @@ async def build_special_page_content(
                     Event.end_date.is_not(None),
                     Event.date <= end_date.isoformat(),
                     Event.end_date >= start_date.isoformat(),
+                    Event.lifecycle_status == "active",
+                    Event.silent.is_(False),
                 )
                 .order_by(Event.date)
             )
@@ -541,6 +573,8 @@ async def build_special_page_content(
                     Event.end_date.is_not(None),
                     Event.date <= end_date.isoformat(),
                     Event.end_date >= start_date.isoformat(),
+                    Event.lifecycle_status == "active",
+                    Event.silent.is_(False),
                 )
                 .order_by(Event.date, Event.time)
             )
@@ -549,6 +583,16 @@ async def build_special_page_content(
             # Festival map for links
             fest_result = await session.execute(select(Festival))
             fest_map = {f.name.casefold(): f for f in fest_result.scalars().all()}
+
+            res_w = await session.execute(
+                select(WeekendPage).order_by(WeekendPage.start)
+            )
+            weekend_pages = res_w.scalars().all()
+        
+        logger.info(
+            "build_special_page_content: exhibitions=%d, fairs=%d",
+            len(exhibitions), len(fairs)
+        )
         
         # Expand fairs across the range
         if fairs:
@@ -583,10 +627,16 @@ async def build_special_page_content(
 
         # Filter out past events
         today = datetime.now(LOCAL_TZ).date()
+        events_before_filter = len(events)
         events = [
             e for e in events
             if max(e.date, e.end_date or e.date) >= today.isoformat()
         ]
+        
+        logger.info(
+            "build_special_page_content: after past-filter %d -> %d events (today=%s)",
+            events_before_filter, len(events), today.isoformat()
+        )
         
         # Ensure telegraph links
         for e in events:
@@ -595,6 +645,12 @@ async def build_special_page_content(
         
         # Group events
         grouped = group_events_for_special(events)
+        
+        total_groups = sum(len(g) for g in grouped.values())
+        logger.info(
+            "build_special_page_content: grouped into %d days, %d total groups",
+            len(grouped), total_groups
+        )
         
         # Build content
         content: list[dict] = []
@@ -609,25 +665,45 @@ async def build_special_page_content(
             })
             content.extend(telegraph_br())
         
-        # Title as h3
-        content.append({"tag": "h3", "children": [title]})
-        content.extend(telegraph_br())
+        # Title as h3 - only for multi-day pages (single-day uses Telegraph page title)
+        if days > 1:
+            content.append({"tag": "h3", "children": [title]})
+            content.extend(telegraph_br())
+        
+        # Intro paragraph with event count (with proper Russian declension)
+        total_events = sum(len(g) for g in grouped.values())
+        if total_events > 0:
+            # Russian plural forms: 1 событие, 2-4 события, 5-20 событий, 21 событие...
+            n = total_events
+            if n % 10 == 1 and n % 100 != 11:
+                event_word = "событие"
+            elif 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+                event_word = "события"
+            else:
+                event_word = "событий"
+            
+            content.append({
+                "tag": "p",
+                "children": [f"Мы нашли для вас {total_events} {event_word}. Приятного досуга!"]
+            })
+            content.extend(telegraph_br())
         
         # Events by day
         sorted_days = sorted(grouped.keys())
         show_images = True
         
         for day in sorted_days:
-            # Day header
-            content.extend(telegraph_br())
-            if day.weekday() == 5:
-                content.append({"tag": "h3", "children": ["🟥🟥🟥 суббота 🟥🟥🟥"]})
-            elif day.weekday() == 6:
-                content.append({"tag": "h3", "children": ["🟥🟥 воскресенье 🟥🟥"]})
-            content.append(
-                {"tag": "h3", "children": [f"🟥🟥🟥 {format_day_pretty(day)} 🟥🟥🟥"]}
-            )
-            content.extend(telegraph_br())
+            # Day header - only for multi-day pages
+            if days > 1:
+                content.extend(telegraph_br())
+                if day.weekday() == 5:
+                    content.append({"tag": "h3", "children": ["🟥🟥🟥 суббота 🟥🟥🟥"]})
+                elif day.weekday() == 6:
+                    content.append({"tag": "h3", "children": ["🟥🟥 воскресенье 🟥🟥"]})
+                content.append(
+                    {"tag": "h3", "children": [f"🟥🟥🟥 {format_day_pretty(day)} 🟥🟥🟥"]}
+                )
+                content.extend(telegraph_br())
             
             # Events for this day
             for group in grouped[day]:
@@ -669,6 +745,29 @@ async def build_special_page_content(
                 ex_nodes.extend(telegraph_br())
                 content.extend(ex_nodes)
 
+        weekend_nav: list[dict] = []
+        start = start_date.isoformat()
+        future_weekends = [w for w in weekend_pages if w.start >= start]
+        if future_weekends:
+            nav_children = []
+            for idx, w in enumerate(future_weekends):
+                s = date.fromisoformat(w.start)
+                label = format_weekend_range(s)
+                if w.start == start:
+                    nav_children.append(label)
+                else:
+                    nav_children.append(
+                        {"tag": "a", "attrs": {"href": w.url}, "children": [label]}
+                    )
+                if idx < len(future_weekends) - 1:
+                    nav_children.append(" ")
+            weekend_nav = [{"tag": "h4", "children": nav_children}]
+
+        if weekend_nav:
+            content.extend(telegraph_br())
+            content.extend(weekend_nav)
+            content.extend(telegraph_br())
+
         # Month navigation
         month_key = start_date.strftime("%Y-%m")
         # Pass current_month=None so that the current month is also a link (clickable)
@@ -680,9 +779,9 @@ async def build_special_page_content(
         # Check size
         size = rough_size(content)
         if size <= size_limit:
-            page_title = f"{title} — {format_day_pretty(start_date)}"
-            if days > 1:
-                page_title = f"{title}"
+            # For single-day pages, title already contains the date
+            # For multi-day pages, use title as-is
+            page_title = title
             return page_title, content, size, days
         
         # Size exceeded, reduce days
@@ -718,6 +817,29 @@ async def build_special_page_content(
         for group in grouped[day]:
             content.extend(render_special_group(group, show_image=False))
 
+    weekend_nav: list[dict] = []
+    start = start_date.isoformat()
+    future_weekends = [w for w in weekend_pages if w.start >= start]
+    if future_weekends:
+        nav_children = []
+        for idx, w in enumerate(future_weekends):
+            s = date.fromisoformat(w.start)
+            label = format_weekend_range(s)
+            if w.start == start:
+                nav_children.append(label)
+            else:
+                nav_children.append(
+                    {"tag": "a", "attrs": {"href": w.url}, "children": [label]}
+                )
+            if idx < len(future_weekends) - 1:
+                nav_children.append(" ")
+        weekend_nav = [{"tag": "h4", "children": nav_children}]
+
+    if weekend_nav:
+        content.extend(telegraph_br())
+        content.extend(weekend_nav)
+        content.extend(telegraph_br())
+
     month_key = start_date.strftime("%Y-%m")
     # Pass current_month=None so that the current month is also a link (clickable)
     nav_html = await build_month_nav_block(db, current_month=None)
@@ -743,16 +865,47 @@ async def create_special_telegraph_page(
     Returns:
         (telegraph_url, used_days)
     """
-    telegraph_create_page = require_main_attr("telegraph_create_page")
-    get_telegraph = require_main_attr("get_telegraph")
+    logger = logging.getLogger(__name__)
     
-    page_title, content, size, used_days = await build_special_page_content(
-        db, start_date, days, cover_url, title
-    )
+    try:
+        telegraph_create_page = require_main_attr("telegraph_create_page")
+        get_telegraph = require_main_attr("get_telegraph")
+    except RuntimeError as e:
+        logger.error(
+            "create_special_telegraph_page: failed to get main attrs: %s",
+            e
+        )
+        return "", 0
     
-    tg = get_telegraph()
-    result = await telegraph_create_page(tg, page_title, content)
-    url = result.get("url", "")
+    try:
+        page_title, content, size, used_days = await build_special_page_content(
+            db, start_date, days, cover_url, title
+        )
+    except Exception as e:
+        logger.error(
+            "create_special_telegraph_page: build_special_page_content failed: %s",
+            e, exc_info=True
+        )
+        return "", 0
+    
+    try:
+        tg = get_telegraph()
+    except RuntimeError as e:
+        logger.error(
+            "create_special_telegraph_page: get_telegraph() failed (token issue?): %s",
+            e
+        )
+        return "", 0
+    
+    try:
+        result = await telegraph_create_page(tg, page_title, content)
+        url = result.get("url", "")
+    except Exception as e:
+        logger.error(
+            "create_special_telegraph_page: telegraph_create_page failed: %s",
+            e, exc_info=True
+        )
+        return "", 0
     
     logging.info(
         "special_page created: url=%s size=%d days=%d",

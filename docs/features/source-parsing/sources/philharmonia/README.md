@@ -1,0 +1,44 @@
+# Philharmonia Parser (Филармония)
+
+> **Linear Task:** [EVE-21](https://linear.app/events-bot-new/issue/EVE-21/parsing-sajta-filarmonii-deep-parsing-and-formatting)
+> **Status:** 🚧 Partially Implemented
+> **Implemented:** Basic List Parsing (Title, Date, Time)
+> **Not Implemented:** Deep Parsing (Detail Page), Program Formatting
+
+## 1. Обзор
+Парсинг событий Калининградской областной филармонии.
+*   **Источник:** `teatr39.ru` (или актуальный сайт филармонии)
+*   **Метод:** Kaggle Notebook (Selenium/BeautifulSoup)
+
+## 2. Требования к Парсингу
+
+### 2.1. Basic Parsing (Implemented ✅)
+*   Сбор списка событий с главной страницы афиши.
+*   Извлечение базовых полей: Название, Дата, Время, Ссылка на билеты.
+
+### 2.2. Deep Parsing (Not Implemented / Bug ❌)
+> **Problem:** Текущая реализация (`parse_philharmonia.ipynb`) пытается перейти на детальную страницу, но часто не находит текст (селектор `div.mer_item_info_text` или `div.text`), и **молча откатывается** к короткому описанию из списка (`.mer_item_list_progr`).
+> **Result:** В событиях не хватает описания и программы, хотя код переходов вроде бы есть.
+> **Requirement:**
+1.  **Fix Selectors:** Актуализировать CSS-селекторы для детальной страницы.
+2.  **No Fallback:** Если детальный текст не найден, не использовать обрубок из списка, а сигнализировать об ошибке или искать по другим признакам.
+3.  **Ensure Usage:** Гарантировать, что используется именно `full_desc_text` с детальной страницы.
+
+### 2.3. Program Formatting (Not Implemented ❌)
+> **Problem:** В коде извлекается все описание (`inner_text`) одним блоком. Список произведений ("В программе:") сливается в кашу.
+> **Requirement:**
+1.  **Detection:** Найти блок "В программе" внутри описания.
+2.  **Formatting:**
+    *   Преобразовать в чистый HTML список (`<ul><li>...</li></ul>`).
+    *   Выделить произведения в отдельные строки.
+3.  **Telegraph:** При генерации страницы этот список должен быть красиво оформлен.
+
+### 2.4. Gallery Extraction (Not Implemented ❌)
+> **Current:** Берется только одна картинка (`img.mer_item_img`) со списка событий.
+> **Requirement:**
+1.  На детальной странице искать дополнительные изображения/галерею.
+2.  Сохранять их в массив `images`.
+
+## 3. Техническая реализация
+*   **Notebook:** `kaggle/ParsePhilharmonia`
+*   **Output:** `philharmonia.json`

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -12,10 +13,12 @@ from aiogram.types import FSInputFile
 from sqlalchemy import select
 
 from db import Database
+from main import format_day_pretty
 from models import (
     Event,
     VideoAnnounceEventHit,
     VideoAnnounceItem,
+    VideoAnnounceItemStatus,
     VideoAnnounceSession,
     VideoAnnounceSessionStatus,
 )
@@ -25,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _status_messages: dict[int, tuple[int, int]] = {}
 _status_locks: dict[int, asyncio.Lock] = {}
+_poller_tasks: dict[int, asyncio.Task] = {}
 
 
 def _read_positive_int(env_key: str, default: int) -> int:
@@ -47,7 +51,7 @@ def _read_positive_int(env_key: str, default: int) -> int:
 
 
 VIDEO_MAX_MB = _read_positive_int("VIDEO_MAX_MB", 50)
-VIDEO_KAGGLE_TIMEOUT_MINUTES = _read_positive_int("VIDEO_KAGGLE_TIMEOUT_MINUTES", 40)
+VIDEO_KAGGLE_TIMEOUT_MINUTES = _read_positive_int("VIDEO_KAGGLE_TIMEOUT_MINUTES", 225)
 
 logger.info(
     "video_announce: limits configured max_video_mb=%s kaggle_timeout_min=%s",
@@ -77,6 +81,155 @@ def _get_status_lock(session_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _status_locks[session_id] = lock
     return lock
+
+
+def _track_poller_task(session_id: int, task: asyncio.Task) -> None:
+    _poller_tasks[session_id] = task
+
+    def _cleanup(_task: asyncio.Task) -> None:
+        _poller_tasks.pop(session_id, None)
+
+    task.add_done_callback(_cleanup)
+
+
+def _poller_active(session_id: int) -> bool:
+    task = _poller_tasks.get(session_id)
+    return bool(task and not task.done())
+
+
+def start_kernel_poller_task(
+    db: Database,
+    client: KaggleClient,
+    session_obj: VideoAnnounceSession,
+    *,
+    bot,
+    notify_chat_id: int,
+    test_chat_id: int | None,
+    main_chat_id: int | None,
+    status_chat_id: int | None = None,
+    status_message_id: int | None = None,
+    poll_interval: int = 60,
+    timeout_minutes: int = VIDEO_KAGGLE_TIMEOUT_MINUTES,
+    download_dir: Path | None = None,
+    dataset_slug: str | None = None,
+) -> asyncio.Task:
+    if _poller_active(session_obj.id):
+        return _poller_tasks[session_obj.id]
+    task = asyncio.create_task(
+        run_kernel_poller(
+            db,
+            client,
+            session_obj,
+            bot=bot,
+            notify_chat_id=notify_chat_id,
+            test_chat_id=test_chat_id,
+            main_chat_id=main_chat_id,
+            status_chat_id=status_chat_id,
+            status_message_id=status_message_id,
+            poll_interval=poll_interval,
+            timeout_minutes=timeout_minutes,
+            download_dir=download_dir,
+            dataset_slug=dataset_slug,
+        )
+    )
+    _track_poller_task(session_obj.id, task)
+    return task
+
+
+def _parse_positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _format_date_range(dates: list[date]) -> str | None:
+    if not dates:
+        return None
+    min_date = min(dates)
+    max_date = max(dates)
+    if min_date == max_date:
+        return format_day_pretty(min_date)
+    return f"{format_day_pretty(min_date)} - {format_day_pretty(max_date)}"
+
+
+def _selection_render_limit(session_obj: VideoAnnounceSession) -> int | None:
+    params = (
+        session_obj.selection_params
+        if isinstance(session_obj.selection_params, dict)
+        else {}
+    )
+    return _parse_positive_int(params.get("render_scene_limit"))
+
+
+def _resolve_notify_chat_id(session_obj: VideoAnnounceSession) -> int | None:
+    params = (
+        session_obj.selection_params
+        if isinstance(session_obj.selection_params, dict)
+        else {}
+    )
+    raw = params.get("notify_chat_id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fallback_target_date_label(session_obj: VideoAnnounceSession) -> str | None:
+    params = (
+        session_obj.selection_params
+        if isinstance(session_obj.selection_params, dict)
+        else {}
+    )
+    raw = params.get("target_date")
+    if not raw:
+        return None
+    try:
+        parsed = date.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    return format_day_pretty(parsed)
+
+
+async def _load_session_date_range(
+    db: Database, session_obj: VideoAnnounceSession
+) -> str | None:
+    limit = _selection_render_limit(session_obj)
+    async with db.get_session() as session:
+        res = await session.execute(
+            select(VideoAnnounceItem)
+            .where(VideoAnnounceItem.session_id == session_obj.id)
+            .where(VideoAnnounceItem.status == VideoAnnounceItemStatus.READY)
+            .order_by(VideoAnnounceItem.position)
+        )
+        items = res.scalars().all()
+        if limit:
+            items = items[:limit]
+        event_ids = [item.event_id for item in items]
+        if not event_ids:
+            return None
+        ev_res = await session.execute(select(Event).where(Event.id.in_(event_ids)))
+        events = ev_res.scalars().all()
+    dates: list[date] = []
+    for ev in events:
+        try:
+            raw_date = (ev.date or "").split("..", 1)[0]
+            dates.append(date.fromisoformat(raw_date))
+        except Exception:
+            continue
+    return _format_date_range(dates)
+
+
+async def _build_video_caption(
+    db: Database, session_obj: VideoAnnounceSession
+) -> str:
+    label = await _load_session_date_range(db, session_obj)
+    if not label:
+        label = _fallback_target_date_label(session_obj)
+    if not label:
+        label = format_day_pretty((datetime.now(timezone.utc) + timedelta(days=1)).date())
+    return f"Видео-анонс #{session_obj.id} на завтра {label}"
 
 
 def _format_kaggle_status(status: dict | None) -> str:
@@ -152,14 +305,76 @@ async def update_status_message(
 
 
 def _find_video(files: Iterable[Path]) -> Path | None:
+    candidates = [
+        file
+        for file in files
+        if file.exists() and file.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"}
+    ]
+    if not candidates:
+        return None
+    preferred = [f for f in candidates if "final" in f.name.lower()]
+    if preferred:
+        return max(preferred, key=lambda f: f.stat().st_size if f.exists() else 0)
+    return max(candidates, key=lambda f: f.stat().st_size if f.exists() else 0)
+
+
+def _find_logs(files: Iterable[Path]) -> list[Path]:
+    return [
+        f
+        for f in files
+        if f.exists() and f.suffix.lower() in {".txt", ".log", ".json"}
+    ]
+
+
+def _find_story_report(files: Iterable[Path]) -> Path | None:
     for file in files:
-        if file.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm"}:
+        if file.exists() and file.name == "story_publish_report.json":
             return file
     return None
 
 
-def _find_logs(files: Iterable[Path]) -> list[Path]:
-    return [f for f in files if f.suffix.lower() in {".txt", ".log", ".json"}]
+def _load_story_report(path: Path | None) -> dict | None:
+    if not path or not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("video_announce: failed to parse story report %s", path)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _story_failure_message(report: dict | None) -> str | None:
+    if not report or report.get("ok") is True:
+        return None
+    failed_targets: list[str] = []
+    for item in report.get("targets") or []:
+        if bool(item.get("ok")):
+            continue
+        label = str(item.get("label") or item.get("peer") or "target")
+        error = str(item.get("error") or "").strip()
+        failed_targets.append(f"{label} ({error})" if error else label)
+    if failed_targets:
+        return "story publish failed: " + "; ".join(failed_targets)
+    error = str(report.get("error") or "").strip()
+    if error:
+        return f"story publish failed: {error}"
+    return "story publish failed"
+
+
+def _expand_output_paths(paths: Iterable[Path]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for p in paths:
+        if p.is_dir():
+            for child in p.rglob("*"):
+                if child.is_file() and child not in seen:
+                    files.append(child)
+                    seen.add(child)
+        elif p.is_file() and p not in seen:
+            files.append(p)
+            seen.add(p)
+    return files
 
 
 async def _update_status(
@@ -348,6 +563,47 @@ async def _cleanup_dataset(client: KaggleClient, dataset_slug: str | None) -> No
         logger.info("video_announce: dataset %s deleted successfully", dataset_slug)
     except Exception:
         logger.exception("video_announce: failed to delete dataset %s", dataset_slug)
+
+
+async def _fail_binding_superseded(
+    db: Database,
+    session_id: int,
+    *,
+    bot,
+    status: dict | None,
+    notify_chat_id: int,
+    status_chat_id: int | None,
+    status_message_id: int | None,
+    dataset_slug: str | None,
+    client: KaggleClient,
+    actual_sources: list[str],
+) -> VideoAnnounceSession | None:
+    session_obj = await _update_status(
+        db,
+        session_id,
+        status=VideoAnnounceSessionStatus.FAILED,
+        error="kernel superseded before output download",
+    )
+    if not session_obj:
+        return None
+    await update_status_message(
+        bot,
+        session_obj,
+        status,
+        chat_id=status_chat_id,
+        message_id=status_message_id,
+        allow_send=True,
+    )
+    details = f" (actual={actual_sources})" if actual_sources else ""
+    await bot.send_message(
+        notify_chat_id,
+        (
+            f"❌ Сессия #{session_obj.id}: kernel больше не привязан к ожидаемому "
+            f"dataset {dataset_slug or '—'}{details}"
+        ),
+    )
+    await _cleanup_dataset(client, dataset_slug)
+    return session_obj
 
 async def run_kernel_poller(
     db: Database,
@@ -549,25 +805,106 @@ async def run_kernel_poller(
         await _cleanup_dataset(client, dataset_slug)
         return
 
+    if dataset_slug:
+        try:
+            binding_ok, binding_meta = await asyncio.to_thread(
+                client.kernel_has_dataset_sources,
+                kernel_ref,
+                [dataset_slug],
+            )
+        except Exception:
+            logger.exception(
+                "video_announce: kernel dataset binding check failed session=%s kernel=%s dataset=%s",
+                session_obj.id,
+                kernel_ref,
+                dataset_slug,
+            )
+            session_obj = await _update_status(
+                db,
+                session_obj.id,
+                status=VideoAnnounceSessionStatus.FAILED,
+                error="kernel dataset binding check failed",
+            )
+            if session_obj:
+                await update_status_message(
+                    bot,
+                    session_obj,
+                    status,
+                    chat_id=status_chat_id,
+                    message_id=status_message_id,
+                    allow_send=True,
+                )
+                await bot.send_message(
+                    notify_chat_id,
+                    (
+                        f"❌ Сессия #{session_obj.id}: не удалось подтвердить binding kernel "
+                        f"к dataset {dataset_slug}"
+                    ),
+                )
+                await _cleanup_dataset(client, dataset_slug)
+            return
+
+        actual_sources = list((binding_meta or {}).get("dataset_sources") or [])
+        if not binding_ok:
+            logger.warning(
+                "video_announce: kernel binding superseded session=%s kernel=%s expected=%s actual=%s",
+                session_obj.id,
+                kernel_ref,
+                dataset_slug,
+                actual_sources,
+            )
+            await _fail_binding_superseded(
+                db,
+                session_obj.id,
+                bot=bot,
+                status=status,
+                notify_chat_id=notify_chat_id,
+                status_chat_id=status_chat_id,
+                status_message_id=status_message_id,
+                dataset_slug=dataset_slug,
+                client=client,
+                actual_sources=actual_sources,
+            )
+            return
+
     tmp_dir = download_dir or Path(os.getenv("TMPDIR", "/tmp"))
     output_dir = tmp_dir / f"videoannounce-{session_obj.id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        files = await asyncio.to_thread(
-            client.download_kernel_output,
-            kernel_ref,
-            path=output_dir,
-            force=True,
-            quiet=True,
-        )
-        paths = [output_dir / Path(f).name for f in files]
-        video_path = _find_video(paths)
-        log_files = _find_logs(paths)
+        max_attempts = 3
+        files: list[str] = []
+        for attempt in range(1, max_attempts + 1):
+            try:
+                files = await asyncio.to_thread(
+                    client.download_kernel_output,
+                    kernel_ref,
+                    path=output_dir,
+                    force=True,
+                    quiet=True,
+                )
+                break
+            except Exception:
+                logger.exception(
+                    "video_announce: kernel output download failed attempt=%s/%s session=%s",
+                    attempt,
+                    max_attempts,
+                    session_obj.id,
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(5 * attempt)
+                else:
+                    raise
+        paths = [output_dir / f for f in files]
+        output_files = _expand_output_paths(paths)
+        video_path = _find_video(output_files)
+        log_files = _find_logs(output_files)
+        story_report_path = _find_story_report(output_files)
+        story_report = _load_story_report(story_report_path)
         if not video_path:
             logger.warning(
                 "video_announce: no video in output session=%s files=%s",
                 session_obj.id,
-                [p.name for p in paths],
+                files or [p.name for p in output_files],
             )
             session_obj = await _update_status(
                 db,
@@ -633,7 +970,56 @@ async def run_kernel_poller(
             message_id=status_message_id,
             allow_send=True,
         )
-        caption = f"Видео-анонс #{session_obj.id}"
+        caption = await _build_video_caption(db, session_obj)
+        story_failure = _story_failure_message(story_report)
+        if story_failure:
+            session_obj = await _update_status(
+                db,
+                session_obj.id,
+                status=VideoAnnounceSessionStatus.FAILED,
+                error=story_failure,
+            )
+            if not session_obj:
+                return
+            await update_status_message(
+                bot,
+                session_obj,
+                status,
+                chat_id=status_chat_id,
+                message_id=status_message_id,
+                allow_send=True,
+                note="Story publish завершился ошибкой",
+            )
+            await bot.send_message(
+                notify_chat_id,
+                f"⚠️ Сессия #{session_obj.id}: {story_failure}",
+            )
+            try:
+                await bot.send_video(
+                    notify_chat_id,
+                    FSInputFile(video_path),
+                    caption=f"{caption}\n\n⚠️ Story publish failed",
+                )
+            except Exception:
+                logger.warning(
+                    "video_announce: failed to send failed-story video to notify chat %s",
+                    notify_chat_id,
+                    exc_info=True,
+                )
+            report_and_logs = []
+            if story_report_path:
+                report_and_logs.append(story_report_path)
+            report_and_logs.extend(
+                file for file in log_files if story_report_path is None or file != story_report_path
+            )
+            if report_and_logs:
+                await _send_logs(
+                    bot,
+                    notify_chat_id,
+                    report_and_logs,
+                    caption=f"⚠️ Story publish report сессии #{session_obj.id}",
+                )
+            return
         target_test = test_chat_id or notify_chat_id
         video_input = FSInputFile(video_path)
         try:
@@ -679,8 +1065,77 @@ async def run_kernel_poller(
                     )
             except Exception as e:
                 logger.warning("video_announce: failed to send video to main chat %s: %s", main_chat_id, e)
+    except Exception:
+        logger.exception(
+            "video_announce: failed to download kernel output session=%s kernel=%s",
+            session_obj.id,
+            kernel_ref,
+        )
+        session_obj = await _update_status(
+            db,
+            session_obj.id,
+            status=VideoAnnounceSessionStatus.FAILED,
+            error="kernel output download failed",
+        )
+        if session_obj:
+            await update_status_message(
+                bot,
+                session_obj,
+                status,
+                chat_id=status_chat_id,
+                message_id=status_message_id,
+                allow_send=True,
+            )
+        await bot.send_message(
+            notify_chat_id,
+            f"⚠️ Сессия #{session_obj.id}: не удалось скачать вывод kernel",
+        )
     finally:
         await _cleanup_dataset(client, dataset_slug)
+
+
+async def resume_rendering_sessions(db: Database, bot, *, chat_id: int | None = None) -> int:
+    async with db.get_session() as session:
+        res = await session.execute(
+            select(VideoAnnounceSession).where(
+                VideoAnnounceSession.status == VideoAnnounceSessionStatus.RENDERING
+            )
+        )
+        sessions = res.scalars().all()
+    if not sessions:
+        return 0
+    recovered = 0
+    admin_chat_id = None
+    if chat_id is None:
+        raw_admin = os.getenv("ADMIN_CHAT_ID")
+        if raw_admin:
+            try:
+                admin_chat_id = int(raw_admin)
+            except (TypeError, ValueError):
+                admin_chat_id = None
+    client = KaggleClient()
+    for sess in sessions:
+        if not sess.kaggle_kernel_ref:
+            continue
+        if _poller_active(sess.id):
+            continue
+        notify_chat_id = _resolve_notify_chat_id(sess) or chat_id or admin_chat_id or sess.test_chat_id or sess.main_chat_id
+        if not notify_chat_id:
+            continue
+        start_kernel_poller_task(
+            db,
+            client,
+            sess,
+            bot=bot,
+            notify_chat_id=notify_chat_id,
+            test_chat_id=sess.test_chat_id,
+            main_chat_id=sess.main_chat_id,
+            poll_interval=60,
+            timeout_minutes=VIDEO_KAGGLE_TIMEOUT_MINUTES,
+            dataset_slug=sess.kaggle_dataset,
+        )
+        recovered += 1
+    return recovered
 
 
 async def reset_stuck_sessions(db: Database, *, max_age_minutes: int = 30) -> int:

@@ -1,0 +1,31 @@
+# Документация
+
+Этот каталог устроен **feature‑ориентированно**: у каждой фичи есть свой “дом” в `docs/features/`.
+
+## Быстрый роутинг (для агентов)
+
+- Машиночитаемая карта: `docs/routes.yml`
+- Список фич: `docs/features/README.md`
+
+## Канонические разделы
+
+- Архитектура: `docs/architecture/overview.md`
+- Эксплуатация: `docs/operations/` (как запускать/поддерживать)
+- Расписание / cron / scheduler routing: `docs/operations/cron.md`
+  - дефолты APScheduler: `scheduling.py`
+  - production overrides: `fly.toml` (`[env]`)
+  - локальный/env шаблон: `.env.example`
+- LLM: `docs/llm/` (промпты, формат запросов, классификатор тем)
+- Справочники: `docs/reference/` (локации, праздники, шаблоны)
+- Пайплайны/парсеры (каноника): `docs/features/source-parsing/` (в `docs/pipelines/` остаются redirect‑stub’ы для старых ссылок)
+- Фичи: `docs/features/`
+- 3D previews (`/3di`): `docs/features/preview-3d/README.md`
+- Бэклог (не реализовано): `docs/backlog/`
+- Отчёты и планы: `docs/reports/` (incident index: `docs/reports/incidents/README.md`)
+- Инструменты: `docs/tools/`
+
+## Правила добавления/обновления доков
+
+1. Новая фича → добавь `docs/features/<feature>/README.md` и внеси её в `docs/routes.yml`.
+2. Не создавай новый документ, если можно расширить существующий канонический.
+3. Если нужно сохранить старый путь (ссылки/история) — оставь короткий redirect‑stub без копирования текста.

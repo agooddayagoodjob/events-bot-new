@@ -2,11 +2,14 @@ __pycache__/
 *.pyc
 .db
 .env
+.pytest_cache/
+.vscode/
 
 # Production database snapshots and WAL files
 db_prod_snapshot.sqlite
 db_prod_snapshot.sqlite-shm
 db_prod_snapshot.sqlite-wal
+*.downloaded_at
 
 # Local database WAL files
 db.sqlite-shm
@@ -25,6 +28,8 @@ test_output.txt
 # Secrets - NEVER commit!
 telegraph_token.txt
 telegraph_token_prod.txt
+id_rsa_fly
+id_rsa_fly-cert.pub
 
 # Backups and test data
 backups/
@@ -32,3 +37,40 @@ test_data/
 
 # Virtual environment (should not be committed)
 .venv/
+.devcontainer/.mcp-auth/
+
+# Local artifacts (never commit)
+artifacts/*
+!artifacts/README.md
+
+# Codex scratch output (keep repo clean)
+.codex/reports/
+.codex/tasks/
+
+# Local DBs / sqlite WALs
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Run outputs
+*.pid
+*.session
+*.session-journal
+bot_logs.txt
+bot_output*.txt
+captured_logs.txt
+logs_analysis.txt
+
+# Local test outputs
+test_result*.txt
+test_*.txt
+test_parser_output/
+
+# Video assets (CrumpleVideo)
+*.mp4
+*.mov
+*.avi
+output/
+frames/
+render/

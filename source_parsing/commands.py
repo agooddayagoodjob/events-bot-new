@@ -8,14 +8,21 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from functools import partial
+from datetime import datetime, timezone
+from pathlib import Path
+import hashlib
+import json
 
 import asyncio
 
 from aiogram import Bot, types
 from aiogram.filters import Command
 
+from admin_chat import resolve_superadmin_chat_id
 from db import Database
+from ops_run import finish_ops_run, start_ops_run
 from models import User
 from source_parsing.handlers import (
     run_source_parsing,
@@ -23,10 +30,87 @@ from source_parsing.handlers import (
     escape_md,
     run_diagnostic_parse,
 )
+from net import http_call
+from heavy_ops import heavy_operation
 
 logger = logging.getLogger(__name__)
 
 MAX_TG_MESSAGE_LEN = 3800
+PARSE_LOCK = asyncio.Lock()
+
+def _resolve_parse_debug_dir() -> Path:
+    env = (os.getenv("SOURCE_PARSING_DEBUG_DIR") or "").strip()
+    if env:
+        return Path(env)
+    if os.path.isdir("/data") and os.access("/data", os.W_OK):
+        return Path("/data/parse_debug")
+    return Path("artifacts/run/parse_debug")
+
+
+SOURCE_PARSING_GUARD_PATH = _resolve_parse_debug_dir() / "source_parsing_guard.json"
+SOURCE_PARSING_GUARD_URLS = {
+    "dramteatr": "https://dramteatr39.ru/afisha",
+    "muzteatr": "https://muzteatr39.ru/action/cat/afisha/",
+    "sobor": "https://sobor39.ru/events/concerts/night/",
+    "tretyakov": "https://kaliningrad.tretyakovgallery.ru/events/",
+    "philharmonia": "https://filarmonia39.ru/?event",
+    "qtickets": "https://kaliningrad.qtickets.events",
+}
+
+
+def _load_source_parsing_guard() -> dict:
+    if not SOURCE_PARSING_GUARD_PATH.exists():
+        return {}
+    try:
+        return json.loads(SOURCE_PARSING_GUARD_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("source_parsing: guard read failed: %s", e)
+        return {}
+
+
+def _save_source_parsing_guard(signatures: dict[str, str]) -> None:
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "signatures": signatures,
+    }
+    try:
+        SOURCE_PARSING_GUARD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SOURCE_PARSING_GUARD_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning("source_parsing: guard write failed: %s", e)
+
+
+async def _collect_source_parsing_signatures() -> dict[str, str]:
+    signatures: dict[str, str] = {}
+    for name, url in SOURCE_PARSING_GUARD_URLS.items():
+        try:
+            response = await http_call(
+                f"source_parsing_guard_{name}",
+                "GET",
+                url,
+                timeout=20,
+                retries=2,
+                backoff=1.0,
+                headers={"User-Agent": "events-bot/1.0"},
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"status={response.status_code}")
+            signatures[name] = hashlib.sha256(response.content).hexdigest()
+        except Exception as e:
+            logger.warning(
+                "source_parsing: guard fetch failed source=%s error=%s", name, e
+            )
+            return {}
+    return signatures
+
+
+async def _update_source_parsing_guard(signatures: dict[str, str] | None = None) -> None:
+    if signatures is None:
+        signatures = await _collect_source_parsing_signatures()
+    if signatures:
+        _save_source_parsing_guard(signatures)
 
 
 def _format_added_events_lines(added_events) -> list[str]:
@@ -35,6 +119,8 @@ def _format_added_events_lines(added_events) -> list[str]:
         "muzteatr": "Музтеатр",
         "sobor": "Собор",
         "tretyakov": "Третьяковка",
+        "philharmonia": "Филармония",
+        "qtickets": "Qtickets",
     }
     lines = [f"📌 **Добавленные события:** {len(added_events)}", ""]
     for item in added_events:
@@ -44,6 +130,38 @@ def _format_added_events_lines(added_events) -> list[str]:
             line = f"• [{title}]({url})"
         else:
             line = f"• {title} — телеграф не создан"
+        suffix_parts = []
+        if item.date:
+            suffix_parts.append(escape_md(item.date))
+        if item.time:
+            suffix_parts.append(escape_md(item.time))
+        source_label = source_labels.get(item.source or "", item.source or "")
+        if source_label:
+            suffix_parts.append(escape_md(source_label))
+        if suffix_parts:
+            line += f" — {', '.join(suffix_parts)}"
+        lines.append(line)
+    return lines
+
+
+def _format_updated_events_lines(updated_events) -> list[str]:
+    """Format updated events list for display."""
+    source_labels = {
+        "dramteatr": "Драмтеатр",
+        "muzteatr": "Музтеатр",
+        "sobor": "Собор",
+        "tretyakov": "Третьяковка",
+        "philharmonia": "Филармония",
+        "qtickets": "Qtickets",
+    }
+    lines = [f"🔄 **Обновлённые события:** {len(updated_events)}", ""]
+    for item in updated_events:
+        title = escape_md(item.title or "Без названия")
+        url = item.telegraph_url
+        if url:
+            line = f"• [{title}]({url})"
+        else:
+            line = f"• {title}"
         suffix_parts = []
         if item.date:
             suffix_parts.append(escape_md(item.date))
@@ -83,6 +201,7 @@ async def handle_parse_check_callback(callback_query: types.CallbackQuery, bot: 
         "parse_check_muzteatr": "muzteatr",
         "parse_check_sobor": "sobor",
         "parse_check_tretyakov": "tretyakov",
+        "parse_check_philharmonia": "philharmonia",
     }
     source = source_map.get(callback_query.data)
     if not source:
@@ -108,7 +227,7 @@ async def handle_parse_command(message: types.Message, db: Database, bot: Bot) -
         await bot.send_message(message.chat.id, "Access denied")
         return
         
-    # Check for arguments (e.g. "/parse check")
+    # Check for arguments (e.g. "/parse check", "/parse dramteatr")
     args = ""
     if message.text:
         parts = message.text.split(maxsplit=1)
@@ -124,6 +243,9 @@ async def handle_parse_command(message: types.Message, db: Database, bot: Bot) -
             [
                 types.InlineKeyboardButton(text="Собор", callback_data="parse_check_sobor"),
                 types.InlineKeyboardButton(text="Третьяковка", callback_data="parse_check_tretyakov"),
+            ],
+            [
+                types.InlineKeyboardButton(text="Филармония", callback_data="parse_check_philharmonia"),
             ]
         ])
         await bot.send_message(
@@ -133,69 +255,176 @@ async def handle_parse_command(message: types.Message, db: Database, bot: Bot) -
             parse_mode="Markdown"
         )
         return
+
+    if args in {"help", "?", "h"}:
+        await bot.send_message(
+            message.chat.id,
+            "Использование:\n"
+            "- /parse — запустить парсинг всех источников\n"
+            "- /parse <source> — запустить парсинг только для одного источника\n"
+            "- /parse <source> --from YYYY-MM-DD --to YYYY-MM-DD — ограничить обработку датами (полезно для E2E)\n"
+            "Доступные источники: dramteatr, muzteatr, sobor, tretyakov, philharmonia, qtickets\n"
+            "- /parse check — диагностический режим (без сохранения в БД)",
+        )
+        return
     
     logger.info("source_parsing: starting parse for user_id=%s", message.from_user.id)
-    
-    await bot.send_message(
-        message.chat.id,
-        "🔄 Запуск парсинга источников (Драмтеатр, Музтеатр, Кафедральный собор, Третьяковка)..."
-    )
-    
-    try:
-        result = await run_source_parsing(db, bot, chat_id=message.chat.id)
-        report = format_parsing_report(result)
-        
+
+    if PARSE_LOCK.locked():
         await bot.send_message(
             message.chat.id,
-            report,
-            parse_mode="Markdown",
+            "⏳ Парсинг уже выполняется. Дождитесь завершения текущего запуска.",
+        )
+        return
+    
+    only_sources: list[str] | None = None
+    date_from: str | None = None
+    date_to: str | None = None
+    if args:
+        tokens = [t for t in re.split(r"[,\s]+", args) if t.strip()]
+        remaining: list[str] = []
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if t in {"--from", "from"} and i + 1 < len(tokens):
+                date_from = tokens[i + 1]
+                i += 2
+                continue
+            if t in {"--to", "to"} and i + 1 < len(tokens):
+                date_to = tokens[i + 1]
+                i += 2
+                continue
+            if t.startswith("from="):
+                date_from = t.split("=", 1)[1].strip()
+                i += 1
+                continue
+            if t.startswith("to="):
+                date_to = t.split("=", 1)[1].strip()
+                i += 1
+                continue
+            remaining.append(t)
+            i += 1
+
+        raw = [p for p in remaining if p.strip()]
+        if raw and raw != ["all"]:
+            only_sources = raw
+
+    if only_sources:
+        await bot.send_message(
+            message.chat.id,
+            "🔄 Запуск парсинга источников (ограничено): " + ", ".join(only_sources),
+        )
+    else:
+        await bot.send_message(
+            message.chat.id,
+            "🔄 Запуск парсинга источников (Драмтеатр, Музтеатр, Кафедральный собор, Третьяковка)...",
         )
 
-        if getattr(result, "added_events", None):
-            lines = _format_added_events_lines(result.added_events)
-            for chunk in _chunk_lines(lines):
+    async with PARSE_LOCK:
+        try:
+            async with heavy_operation(
+                kind="parse",
+                trigger="manual",
+                operator_id=message.from_user.id,
+                chat_id=message.chat.id,
+            ):
+                result = await run_source_parsing(
+                    db,
+                    bot,
+                    chat_id=message.chat.id,
+                    only_sources=only_sources,
+                    date_from=date_from,
+                    date_to=date_to,
+                    trigger="manual",
+                    operator_id=message.from_user.id,
+                )
+            bot_username = None
+            try:
+                me = await bot.get_me()
+                bot_username = (getattr(me, "username", None) or "").strip().lstrip("@") or None
+            except Exception:
+                bot_username = None
+            report = await format_parsing_report(result, bot_username=bot_username, db=db)
+            
+            try:
                 await bot.send_message(
                     message.chat.id,
-                    chunk,
+                    report,
                     parse_mode="Markdown",
                 )
-        else:
+            except Exception as e:
+                logger.warning("source_parsing: failed to send report markdown: %s", e)
+                await bot.send_message(
+                    message.chat.id,
+                    report.replace("**", ""),
+                )
+
+            if getattr(result, "added_events", None):
+                lines = _format_added_events_lines(result.added_events)
+                for chunk in _chunk_lines(lines):
+                    await bot.send_message(
+                        message.chat.id,
+                        chunk,
+                        parse_mode="Markdown",
+                    )
+            else:
+                await bot.send_message(
+                    message.chat.id,
+                    "ℹ️ Новых событий не добавлено.",
+                )
+            
+            # Show updated events with Telegraph links
+            if getattr(result, "updated_events", None):
+                lines = _format_updated_events_lines(result.updated_events)
+                for chunk in _chunk_lines(lines):
+                    await bot.send_message(
+                        message.chat.id,
+                        chunk,
+                        parse_mode="Markdown",
+                    )
+            
+            # Send JSON files if available
+            json_files_sent = 0
+            if hasattr(result, 'json_file_paths') and result.json_file_paths:
+                from aiogram.types import FSInputFile
+                for json_path in result.json_file_paths:
+                    try:
+                        import os
+                        if os.path.exists(json_path):
+                            filename = os.path.basename(json_path)
+                            json_file = FSInputFile(json_path, filename=filename)
+                            await bot.send_document(message.chat.id, json_file)
+                            logger.info("source_parsing: sent JSON file %s", filename)
+                            json_files_sent += 1
+                        else:
+                            logger.warning("source_parsing: JSON file not found %s", json_path)
+                    except Exception as e:
+                        logger.warning("source_parsing: failed to send JSON %s: %s", json_path, e)
+            
+            # Warn if no JSON files were sent
+            if json_files_sent == 0 and result.total_events > 0:
+                await bot.send_message(
+                    message.chat.id,
+                    "⚠️ JSON файлы парсера недоступны (временные файлы удалены).",
+                )
+            
+            # Send log file if available
+            if result.log_file_path:
+                try:
+                    from aiogram.types import FSInputFile
+                    import os
+                    if os.path.exists(result.log_file_path):
+                        log_file = FSInputFile(result.log_file_path, filename="kaggle_log.txt")
+                        await bot.send_document(message.chat.id, log_file)
+                except Exception as e:
+                    logger.warning("source_parsing: failed to send log file: %s", e)
+                    
+        except Exception as e:
+            logger.exception("source_parsing: failed")
             await bot.send_message(
                 message.chat.id,
-                "ℹ️ Новых событий не добавлено.",
+                f"❌ Ошибка парсинга: {e}"
             )
-        
-        # Send JSON files if available
-        if hasattr(result, 'json_file_paths') and result.json_file_paths:
-            from aiogram.types import FSInputFile
-            for json_path in result.json_file_paths:
-                try:
-                    import os
-                    if os.path.exists(json_path):
-                        filename = os.path.basename(json_path)
-                        json_file = FSInputFile(json_path, filename=filename)
-                        await bot.send_document(message.chat.id, json_file)
-                        logger.info("source_parsing: sent JSON file %s", filename)
-                except Exception as e:
-                    logger.warning("source_parsing: failed to send JSON %s: %s", json_path, e)
-        
-        # Send log file if available
-        if result.log_file_path:
-            try:
-                from aiogram.types import FSInputFile
-                import os
-                if os.path.exists(result.log_file_path):
-                    log_file = FSInputFile(result.log_file_path, filename="kaggle_log.txt")
-                    await bot.send_document(message.chat.id, log_file)
-            except Exception as e:
-                logger.warning("source_parsing: failed to send log file: %s", e)
-                
-    except Exception as e:
-        logger.exception("source_parsing: failed")
-        await bot.send_message(
-            message.chat.id,
-            f"❌ Ошибка парсинга: {e}"
-        )
 
 
 async def source_parsing_scheduler(db: Database, bot: Bot, *, run_id: str | None = None) -> None:
@@ -206,12 +435,28 @@ async def source_parsing_scheduler(db: Database, bot: Bot, *, run_id: str | None
     logger.info("source_parsing_scheduler started run_id=%s", run_id)
     
     try:
-        result = await run_source_parsing(db, bot)
+        result = await run_source_parsing(
+            db,
+            bot,
+            trigger="scheduled",
+            operator_id=0,
+            run_id=run_id,
+        )
+
+        should_update_guard = result.total_events > 0 or not result.errors
+        if should_update_guard:
+            await _update_source_parsing_guard()
         
         # Send report to admin chat if configured
-        admin_chat_id = os.getenv("ADMIN_CHAT_ID")
+        admin_chat_id = await resolve_superadmin_chat_id(db)
         if admin_chat_id and (result.stats_by_source or result.errors):
-            report = format_parsing_report(result)
+            bot_username = None
+            try:
+                me = await bot.get_me()
+                bot_username = (getattr(me, "username", None) or "").strip().lstrip("@") or None
+            except Exception:
+                bot_username = None
+            report = await format_parsing_report(result, bot_username=bot_username, db=db)
             try:
                 await bot.send_message(
                     int(admin_chat_id),
@@ -228,6 +473,90 @@ async def source_parsing_scheduler(db: Database, bot: Bot, *, run_id: str | None
         )
     except Exception as e:
         logger.exception("source_parsing_scheduler failed run_id=%s", run_id)
+
+
+async def source_parsing_scheduler_if_changed(
+    db: Database,
+    bot: Bot,
+    *,
+    run_id: str | None = None,
+) -> None:
+    """Scheduled job for source parsing with change guard.
+
+    Skips Kaggle if source pages did not change since the last successful run.
+    """
+    logger.info("source_parsing_scheduler_if_changed started run_id=%s", run_id)
+    try:
+        signatures = await _collect_source_parsing_signatures()
+        if not signatures:
+            logger.info("source_parsing_guard: signatures unavailable, running parse")
+        else:
+            guard_state = _load_source_parsing_guard()
+            if guard_state.get("signatures") == signatures:
+                logger.info("source_parsing_guard: no changes, skipping parse")
+                ops_run_id = await start_ops_run(
+                    db,
+                    kind="parse",
+                    trigger="scheduled",
+                    operator_id=0,
+                    details={
+                        "run_id": run_id,
+                        "reason": "no_changes",
+                    },
+                )
+                await finish_ops_run(
+                    db,
+                    run_id=ops_run_id,
+                    status="skipped",
+                    metrics={
+                        "total_events": 0,
+                        "sources_processed": 0,
+                    },
+                    details={
+                        "run_id": run_id,
+                        "reason": "no_changes",
+                    },
+                )
+                return
+
+        result = await run_source_parsing(
+            db,
+            bot,
+            trigger="scheduled",
+            operator_id=0,
+            run_id=run_id,
+        )
+        should_update_guard = result.total_events > 0 or not result.errors
+        if should_update_guard and signatures:
+            await _update_source_parsing_guard(signatures)
+        elif should_update_guard:
+            await _update_source_parsing_guard()
+
+        admin_chat_id = await resolve_superadmin_chat_id(db)
+        if admin_chat_id and (result.stats_by_source or result.errors):
+            bot_username = None
+            try:
+                me = await bot.get_me()
+                bot_username = (getattr(me, "username", None) or "").strip().lstrip("@") or None
+            except Exception:
+                bot_username = None
+            report = await format_parsing_report(result, bot_username=bot_username, db=db)
+            try:
+                await bot.send_message(
+                    int(admin_chat_id),
+                    f"📊 Автоматический парсинг источников завершён\n\n{report}",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.warning("source_parsing: failed to send report: %s", e)
+
+        logger.info(
+            "source_parsing_scheduler_if_changed complete run_id=%s total=%d",
+            run_id,
+            result.total_events,
+        )
+    except Exception:
+        logger.exception("source_parsing_scheduler_if_changed failed run_id=%s", run_id)
 
 
 def register_parse_command(dp, db: Database, bot: Bot) -> None:

@@ -8,16 +8,17 @@ from datetime import date
 from typing import Callable
 
 from aiogram import types
-from models import Event, User, VideoAnnounceSession
+from models import Event, User, VideoAnnounceSession, VideoAnnounceSessionStatus
 from main import TELEGRAPH_TOKEN_FILE, get_telegraph_token_info
 from .kaggle_client import KaggleClient
-from .poller import remember_status_message, update_status_message
+from .poller import remember_status_message, start_kernel_poller_task, update_status_message
 
 from db import Database
 from .scenario import (
     PendingInstruction,
     PendingIntroText,
     PendingPayloadImport,
+    TOMORROW_TEST_MIN_POSTERS,
     VideoAnnounceScenario,
     handle_prefix_action,
     is_waiting_instruction,
@@ -38,6 +39,10 @@ async def _load_user(db: Database, user_id: int) -> User | None:
 
 
 async def handle_video_command(message: types.Message, db: Database, bot) -> None:
+    user = await _load_user(db, message.from_user.id)
+    if not user or not user.is_superadmin:
+        await bot.send_message(message.chat.id, "Not authorized")
+        return
     token_info = get_telegraph_token_info(create_if_missing=False)
     logger.info(
         "telegraph_token_diagnostics",
@@ -157,6 +162,22 @@ async def handle_video_callback(
         return
     data = callback.data
     scenario = VideoAnnounceScenario(db, bot, callback.message.chat.id, callback.from_user.id)
+    if data.startswith("vidauto:"):
+        action = data.split(":", 1)[1]
+        if action == "tomorrow":
+            await callback.answer("Готовлю подбор…")
+            await scenario.prepare_tomorrow_session(profile_key="default", test_mode=False)
+            return
+        if action == "test_tomorrow":
+            await callback.answer("Готовлю тестовый подбор…")
+            await scenario.prepare_tomorrow_session(
+                profile_key="default",
+                selected_max=TOMORROW_TEST_MIN_POSTERS,
+                test_mode=True,
+            )
+            return
+        await callback.answer("Неизвестное действие", show_alert=True)
+        return
     if data.startswith("vidkstat:"):
         try:
             _, raw_session_id = data.split(":", 1)
@@ -190,6 +211,24 @@ async def handle_video_callback(
             message_id=callback.message.message_id,
             allow_send=True,
         )
+        state = str((status or {}).get("status") or "").lower()
+        if session_obj.status == VideoAnnounceSessionStatus.RENDERING and state == "complete":
+            await callback.answer("Kernel завершён, забираю результаты…")
+            start_kernel_poller_task(
+                db,
+                client,
+                session_obj,
+                bot=bot,
+                notify_chat_id=callback.message.chat.id,
+                test_chat_id=session_obj.test_chat_id,
+                main_chat_id=session_obj.main_chat_id,
+                status_chat_id=callback.message.chat.id,
+                status_message_id=callback.message.message_id,
+                poll_interval=15,
+                timeout_minutes=5,
+                dataset_slug=session_obj.kaggle_dataset,
+            )
+            return
         await callback.answer("Обновлено")
         return
     if data.startswith("vidsel:"):

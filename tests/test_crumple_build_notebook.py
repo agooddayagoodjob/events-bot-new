@@ -87,3 +87,7 @@ def test_embedded_helpers_match_repo_sources():
     assert embedded_gesture == GESTURE_MODULE_PATH.read_text(encoding="utf-8").rstrip("\n")
     assert "from story_gesture_overlay import GESTURE_STEP_COUNT, apply_story_gesture_frame" in source
     assert "pending_gesture_step" in source
+    assert "def _safe_telegram_cache_path(url: str, idx: int, posters_dir: Path) -> Path:" in source
+    assert "telegram_cache = _prepare_telegram_cache(urls_to_cache, posters_dir)" in source
+    assert "telegram_cache = {url: path for url, path in url_map.items() if path.exists()}" not in source
+    assert 'local_path = posters_dir / f"tg_{idx}_{fname}"' not in source

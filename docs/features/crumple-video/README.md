@@ -389,6 +389,10 @@ color: #100E0E;
   - для story-video действует отдельный guard `30 MB`: если финальный mp4 больше, notebook считает story publish failed и пишет это в report;
   - notebook пишет `story_publish_report.json` в output и считает run failed, если story publish был включён, но любой target завершился ошибкой.
   - production env дополнительно может включать `VIDEO_ANNOUNCE_STORY_REQUIRED=1`; тогда `/healthz` обязан считать runtime unhealthy, если stories неожиданно выключены или story-auth/story-target path повреждён, чтобы branch/config drift не оставлял `/v` “успешным” без story fanout.
+- Отдельно от story publish:
+  - poster-fetch для самих афиш не должен требовать `TELEGRAM_SESSION`, `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` или Kaggle secrets;
+  - Telegram/Telethon lookup допустим только как best-effort cache fallback для image URLs и не должен валить render, если secrets отсутствуют, cache search не сработал или local cache path невалиден;
+  - при отсутствии cache-hit pipeline обязан продолжать обычный HTTP download poster assets.
 - Для быстрого smoke-check перед долгим рендером есть отдельный image-only runner: `kaggle/execute_crumple_story_smoke.py`.
 - Дефолтный runtime timeout для `/v` поднят до `225` минут (`VIDEO_KAGGLE_TIMEOUT_MINUTES`), чтобы длинные Kaggle runs успевали не только дорендерить mp4, но и отдать output на download path.
 - Live preflight on `2026-04-07` уже проходил для обоих production targets `@kenigevents` и `@lovekenig` на premium-сессии, поэтому актуальный rollout-risk для stories лежит в code/config path, а не в старом `BOOSTS_REQUIRED`.

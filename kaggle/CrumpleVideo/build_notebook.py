@@ -163,6 +163,92 @@ def main() -> None:
         "            gesture_step_index += 1\n"
         "        sequence.extend(ball_frames)\n"
     )
+    telegram_cache_helper_old = (
+        "def _prepare_telegram_cache(urls, posters_dir):\n"
+        "    if not TELEGRAM_READY or not urls:\n"
+        "        return {}\n"
+        "    filenames_map = {}\n"
+        "    url_map = {}\n"
+        "    for idx, url in enumerate(urls):\n"
+        "        if not isinstance(url, str):\n"
+        "            continue\n"
+        "        fname = url.split('/')[-1].split('?')[0]\n"
+        "        if not fname:\n"
+        "            continue\n"
+        "        local_path = posters_dir / f\"tg_{idx}_{fname}\"\n"
+        "        filenames_map[fname] = str(local_path)\n"
+        "        url_map[url] = local_path\n"
+        "    if filenames_map:\n"
+        "        _run_async(download_via_telegram(filenames_map))\n"
+        "    cache = {}\n"
+        "    for url, path in url_map.items():\n"
+        "        if path.exists():\n"
+        "            cache[url] = path\n"
+        "    if cache:\n"
+        "        log(f\"✅ Telegram cache hits: {len(cache)}\")\n"
+        "    return cache\n"
+    )
+    telegram_cache_helper_new = (
+        "def _safe_telegram_cache_path(url: str, idx: int, posters_dir: Path) -> Path:\n"
+        "    fname = str(url).split('/')[-1].split('?')[0]\n"
+        "    suffix = Path(fname).suffix.lower()\n"
+        "    if suffix not in {'.jpg', '.jpeg', '.png', '.webp'}:\n"
+        "        suffix = '.jpg'\n"
+        "    digest = hashlib.sha1(str(url).encode('utf-8')).hexdigest()[:16]\n"
+        "    return posters_dir / f\"tg_{idx}_{digest}{suffix}\"\n"
+        "\n"
+        "\n"
+        "def _prepare_telegram_cache(urls, posters_dir):\n"
+        "    if not TELEGRAM_READY or not urls:\n"
+        "        return {}\n"
+        "    filenames_map = {}\n"
+        "    url_map = {}\n"
+        "    for idx, url in enumerate(urls):\n"
+        "        if not isinstance(url, str):\n"
+        "            continue\n"
+        "        fname = url.split('/')[-1].split('?')[0]\n"
+        "        if not fname:\n"
+        "            continue\n"
+        "        local_path = _safe_telegram_cache_path(url, idx, posters_dir)\n"
+        "        filenames_map[fname] = str(local_path)\n"
+        "        url_map[url] = local_path\n"
+        "    if filenames_map:\n"
+        "        _run_async(download_via_telegram(filenames_map))\n"
+        "    cache = {}\n"
+        "    for url, path in url_map.items():\n"
+        "        try:\n"
+        "            if path.exists():\n"
+        "                cache[url] = path\n"
+        "        except OSError:\n"
+        "            continue\n"
+        "    if cache:\n"
+        "        log(f\"✅ Telegram cache hits: {len(cache)}\")\n"
+        "    return cache\n"
+    )
+    telegram_cache_block_old = (
+        "    if urls_to_cache:\n"
+        "        filenames_map = {}\n"
+        "        for idx, url in enumerate(urls_to_cache):\n"
+        "            fname = url.split('/')[-1].split('?')[0]\n"
+        "            if not fname:\n"
+        "                continue\n"
+        "            local_path = posters_dir / f\"tg_{idx}_{fname}\"\n"
+        "            filenames_map[fname] = str(local_path)\n"
+        "            url_map[url] = local_path\n"
+        "        if TELEGRAM_READY and filenames_map:\n"
+        "            _run_async(download_via_telegram(filenames_map))\n"
+        "        elif not TELEGRAM_READY:\n"
+        "            log(f\"[SKIP] Telegram cache disabled: {TELEGRAM_ERROR}\")\n"
+        "        telegram_cache = {url: path for url, path in url_map.items() if path.exists()}\n"
+        "        if telegram_cache:\n"
+        "            log(f\"✅ Telegram cache hits: {len(telegram_cache)}\")\n"
+    )
+    telegram_cache_block_new = (
+        "    if urls_to_cache:\n"
+        "        telegram_cache = _prepare_telegram_cache(urls_to_cache, posters_dir)\n"
+        "        if telegram_cache:\n"
+        "            url_map.update(telegram_cache)\n"
+    )
 
     replaced = False
     for cell in notebook.get("cells", []):
@@ -209,6 +295,14 @@ def main() -> None:
             source = source.replace(hold_ball_old, hold_ball_new, 1)
         elif hold_ball_new not in source:
             raise RuntimeError("Could not locate hold-ball block in notebook")
+        if telegram_cache_helper_old in source:
+            source = source.replace(telegram_cache_helper_old, telegram_cache_helper_new, 1)
+        elif telegram_cache_helper_new not in source:
+            raise RuntimeError("Could not locate telegram cache helper block in notebook")
+        if telegram_cache_block_old in source:
+            source = source.replace(telegram_cache_block_old, telegram_cache_block_new, 1)
+        elif telegram_cache_block_new not in source:
+            raise RuntimeError("Could not locate telegram cache block in notebook")
         cell["source"] = source.splitlines(keepends=True) if source_was_list else source
         replaced = True
         break

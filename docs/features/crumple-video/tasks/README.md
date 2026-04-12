@@ -32,6 +32,10 @@
 
 ## Current Gaps
 
+- Telegram-story onboarding for `hold to pause` / seek is implemented, but still needs manual validation on a real published story:
+  - current runtime uses the approved 3-step CTA sequence with lightweight `Cygre` styling and a subtle touch cue;
+  - rollout keeps total duration and shot composition unchanged, and uses only the folded-paper intervals between scenes;
+  - remaining validation: confirm in a live Telegram story that the CTA stays secondary, readable, and non-annoying on repeat views.
 - Notebook всё ещё жёстко режет сцены до `12` через `scenes[:12]`, поэтому продовый cap `16` сейчас не поддержан фактическим рендером.
 - Если у профиля настроен `main`-канал, готовое видео автоматически уходит не только в test, но и в main. Для ручного продового контроля это риск.
 - Тестовый режим сейчас выставляет `allow_empty_ocr=True`, поэтому тестовый прогон не полностью повторяет продовое качество отбора.

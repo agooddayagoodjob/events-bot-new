@@ -23,7 +23,9 @@ import os
 import shutil
 import tempfile
 import time
+import zipfile
 from datetime import date, timedelta
+from io import BytesIO
 from pathlib import Path
 
 from video_announce.kaggle_client import KaggleClient
@@ -39,6 +41,8 @@ PROJECT_ROOT = Path(__file__).parent.parent
 KERNEL_DIR = PROJECT_ROOT / "kaggle" / "CrumpleVideo"
 TEST_AFISHA_DIR = PROJECT_ROOT / "video_announce" / "test_afisha"
 ASSETS_DIR = PROJECT_ROOT / "video_announce" / "assets"
+CYGRE_FONT_DIR = PROJECT_ROOT / "kaggle" / "CherryFlash" / "assets" / "ro_znanie_fonts"
+CYGRE_FONT_ZIP = CYGRE_FONT_DIR.parent / "ro_znanie.zip"
 OUTPUT_DIR = PROJECT_ROOT / "artifacts" / "crumple_test"
 
 
@@ -110,6 +114,44 @@ async def run_crumple_test():
             shutil.copy2(font, dataset_path / font.name)
         for font in ASSETS_DIR.glob("*.otf"):
             shutil.copy2(font, dataset_path / font.name)
+        for font_name in ("Cygre-Medium.ttf", "Cygre-Regular.ttf"):
+            font_path = CYGRE_FONT_DIR / font_name
+            if font_path.exists():
+                shutil.copy2(font_path, dataset_path / font_name)
+                continue
+            if CYGRE_FONT_ZIP.exists():
+                with zipfile.ZipFile(CYGRE_FONT_ZIP) as zf:
+                    member = next(
+                        (
+                            name
+                            for name in zf.namelist()
+                            if not name.endswith("/") and Path(name).name == font_name
+                        ),
+                        None,
+                    )
+                    if member is not None:
+                        (dataset_path / font_name).write_bytes(zf.read(member))
+                        continue
+                    nested_zip_name = next(
+                        (
+                            name
+                            for name in zf.namelist()
+                            if not name.endswith("/") and Path(name).name == "cygre_default.zip"
+                        ),
+                        None,
+                    )
+                    if nested_zip_name is not None:
+                        with zipfile.ZipFile(BytesIO(zf.read(nested_zip_name))) as nested:
+                            nested_member = next(
+                                (
+                                    name
+                                    for name in nested.namelist()
+                                    if not name.endswith("/") and Path(name).name == font_name
+                                ),
+                                None,
+                            )
+                            if nested_member is not None:
+                                (dataset_path / font_name).write_bytes(nested.read(nested_member))
         logger.info("Copied fonts")
         
         # Copy audio

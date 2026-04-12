@@ -11,6 +11,7 @@
 
 - Архитектура: `docs/architecture/overview.md`
 - Эксплуатация: `docs/operations/` (как запускать/поддерживать)
+- Workflow репозитория и worktree/branch policy: `docs/operations/repository-workflow.md`
 - Incident management / closure gate: `docs/operations/incident-management.md`
 - Расписание / cron / scheduler routing: `docs/operations/cron.md`
   - дефолты APScheduler: `scheduling.py`

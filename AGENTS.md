@@ -84,6 +84,32 @@
 - Отчёты/черновики Codex CLI по умолчанию складывай в `artifacts/codex/` (см. `docs/tools/codex-cli.md`).
 - Не коммить артефакты. Если нужно сохранить пример — клади **минимальный** fixture в `tests/fixtures/` (если такой паттерн уже есть).
 
+## Git / Push Policy
+
+- Канонический workflow для branch/worktree и безопасной изоляции параллельной разработки: `docs/operations/repository-workflow.md`.
+- Держи облачный репозиторий разумно актуальным в ходе обычной работы, а не только в конце длинной серии правок.
+- После durable-изменений по текущей задаче stage/commit/push их в `origin`, если нет явного запрета пользователя и если задача не находится в промежуточной несогласованной стадии.
+- Перед любым push и deploy обязательно смотри `git status` и stage файлы явно.
+- По умолчанию stage/commit/push только файлы, напрямую относящиеся к текущему запросу.
+- Никогда не считай грязный worktree нормальной базой для production deploy.
+- Если текущий checkout грязный из-за другой незавершённой работы, это не причина бросать prod-bound задачу на полпути:
+  - сначала привяжи существующую незавершённую работу к явной branch/origin-state, если она ещё не привязана;
+  - затем изолируй текущую задачу в отдельный linked worktree от явной базы (`origin/main` или уже запушенной integration branch);
+  - не переноси production fix из “локальной призрачной базы”, которую нельзя воспроизвести из `origin`.
+
+## Release / Deploy Governance
+
+- `origin/main` — единственный steady-state source of truth для production. Каноника: `docs/operations/release-governance.md`.
+- `release/*` и `hotfix/*` допустимы только как короткоживущие ветки; prod-fix не считается доставленным, пока commit не достижим из `origin/main`.
+- Не оставляй production-значимые фиксы только в side-ветках и не закрывай инцидент до back-merge в `main`.
+- Перед deploy обязательно:
+  - `git fetch origin --prune`
+  - проверить branch, чистоту worktree и связь с `origin/main`
+  - сверить релевантные пункты `CHANGELOG.md` с реальными commit/SHA
+  - проверить, нет ли `release/*` / `hotfix/*`, которые всё ещё ahead of `origin/main`
+- GitHub Actions deploy допустим только если workflow явно checkout-ит и проверяет `main`.
+- Ручной `flyctl deploy` допустим только из clean worktree; если deploy emergency и идёт не из `main`, branch должен быть запушен, SHA зафиксирован, а тот же fix обязан вернуться в `main` в рамках того же инцидента.
+
 ## Избегаем дубликатов
 
 - Один факт/инструкция — один “канонический” документ.

@@ -12,6 +12,7 @@ sections:
     incident_management: docs/operations/incident-management.md
     commands: docs/operations/commands.md
     cron: docs/operations/cron.md
+    repository_workflow: docs/operations/repository-workflow.md
     release_governance: docs/operations/release-governance.md
     runtime_logs: docs/operations/runtime-logs.md
     scheduler_routing:

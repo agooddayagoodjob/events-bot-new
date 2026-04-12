@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
@@ -3015,6 +3016,14 @@ class VideoAnnounceScenario:
 
     def _copy_assets(self, tmp_path: Path, *, audio_name: str | None = None) -> None:
         assets_dir = Path(__file__).resolve().parent / "assets"
+        cygre_dir = (
+            Path(__file__).resolve().parent.parent
+            / "kaggle"
+            / "CherryFlash"
+            / "assets"
+            / "ro_znanie_fonts"
+        )
+        cygre_zip = cygre_dir.parent / "ro_znanie.zip"
         # CrumpleVideo session datasets carry only the canonical font/final
         # frame pair plus the single required audio track for the render.
         # We need to find the font. The example says "Oswald-VariableFont_wght.ttf"
@@ -3039,6 +3048,55 @@ class VideoAnnounceScenario:
                 continue
             shutil.copy2(src, dest)
             logger.info("video_announce: copied asset %s (%s bytes)", dest.name, dest.stat().st_size)
+        for font_name in ("Cygre-Medium.ttf", "Cygre-Regular.ttf"):
+            font_src = cygre_dir / font_name
+            if font_src.exists():
+                shutil.copy2(font_src, tmp_path / font_name)
+                logger.info("video_announce: copied asset %s (%s bytes)", font_name, (tmp_path / font_name).stat().st_size)
+                continue
+            if cygre_zip.exists():
+                with zipfile.ZipFile(cygre_zip) as zf:
+                    member = next(
+                        (
+                            name
+                            for name in zf.namelist()
+                            if not name.endswith("/") and Path(name).name == font_name
+                        ),
+                        None,
+                    )
+                    if member is not None:
+                        (tmp_path / font_name).write_bytes(zf.read(member))
+                        logger.info("video_announce: extracted asset %s from %s", font_name, cygre_zip)
+                        continue
+                    nested_zip_name = next(
+                        (
+                            name
+                            for name in zf.namelist()
+                            if not name.endswith("/") and Path(name).name == "cygre_default.zip"
+                        ),
+                        None,
+                    )
+                    if nested_zip_name is not None:
+                        with zipfile.ZipFile(BytesIO(zf.read(nested_zip_name))) as nested:
+                            nested_member = next(
+                                (
+                                    name
+                                    for name in nested.namelist()
+                                    if not name.endswith("/") and Path(name).name == font_name
+                                ),
+                                None,
+                            )
+                            if nested_member is not None:
+                                (tmp_path / font_name).write_bytes(nested.read(nested_member))
+                                logger.info(
+                                    "video_announce: extracted asset %s from %s -> %s",
+                                    font_name,
+                                    cygre_zip,
+                                    nested_zip_name,
+                                )
+                                continue
+            logger.error("video_announce: MISSING required asset %s", font_src)
+            missing.append(font_name)
         if missing:
             raise RuntimeError(f"Missing required assets: {missing}. Check that assets folder is deployed.")
 

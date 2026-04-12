@@ -1141,6 +1141,15 @@ async def run_vk_auto_import(
     except Exception:
         progress_every = 1
     progress_every = max(1, min(progress_every, 50))
+    try:
+        row_timeout_raw = (os.getenv("VK_AUTO_IMPORT_ROW_TIMEOUT_SEC") or "").strip()
+        row_timeout_sec = float(row_timeout_raw) if row_timeout_raw else 30.0 * 60.0
+    except Exception:
+        row_timeout_sec = 30.0 * 60.0
+    if row_timeout_sec <= 0:
+        row_timeout_sec = 0.0
+    else:
+        row_timeout_sec = min(float(row_timeout_sec), 6.0 * 60.0 * 60.0)
 
     # Optional: include previously skipped rows in the run. This is useful for
     # E2E over a prod DB snapshot where an operator may have skipped items
@@ -1272,6 +1281,65 @@ async def run_vk_auto_import(
                 )
             )
 
+        async def _await_process_task(
+            *,
+            post_obj: Any,
+            source_url: str,
+            process_task: asyncio.Task,
+        ) -> None:
+            try:
+                if row_timeout_sec > 0:
+                    await asyncio.wait_for(process_task, timeout=row_timeout_sec)
+                else:
+                    await process_task
+            except asyncio.TimeoutError:
+                report.inbox_failed += 1
+                report.errors.append(
+                    f"timeout_failed {source_url}: row timed out after {row_timeout_sec:.1f}s"
+                )
+                try:
+                    await vk_review.mark_failed(db, int(post_obj.id))
+                except Exception:
+                    logger.warning("vk_auto: mark_failed failed after timeout", exc_info=True)
+                logger.warning(
+                    "vk_auto: inbox row timeout id=%s url=%s timeout_sec=%.1f",
+                    getattr(post_obj, "id", None),
+                    source_url,
+                    row_timeout_sec,
+                )
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        (
+                            "❌ VK auto import: таймаут обработки поста\n"
+                            f"{source_url}\n"
+                            f"timeout_sec={row_timeout_sec:.1f}"
+                        ),
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    logger.warning("vk_auto: timeout_send_failed", exc_info=True)
+            except Exception as exc:
+                report.inbox_failed += 1
+                report.errors.append(f"unexpected_failed {source_url}: {exc}")
+                try:
+                    await vk_review.mark_failed(db, int(post_obj.id))
+                except Exception:
+                    logger.warning("vk_auto: mark_failed failed after exception", exc_info=True)
+                logger.exception(
+                    "vk_auto: unexpected exception in inbox row processing id=%s url=%s",
+                    getattr(post_obj, "id", None),
+                    source_url,
+                )
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        f"❌ VK auto import: техническая ошибка при обработке поста\n{source_url}\n{exc}",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
         if unbounded:
             post = await vk_review.pick_next(
                 db,
@@ -1342,28 +1410,11 @@ async def run_vk_auto_import(
                 )
                 next_prefetch_task = _start_prefetch(next_post) if next_post else None
 
-                try:
-                    await process_task
-                except Exception as exc:
-                    report.inbox_failed += 1
-                    report.errors.append(f"unexpected_failed {source_url}: {exc}")
-                    try:
-                        await vk_review.mark_failed(db, int(post.id))
-                    except Exception:
-                        logger.warning("vk_auto: mark_failed failed after exception", exc_info=True)
-                    logger.exception(
-                        "vk_auto: unexpected exception in inbox row processing id=%s url=%s",
-                        getattr(post, "id", None),
-                        source_url,
-                    )
-                    try:
-                        await bot.send_message(
-                            chat_id,
-                            f"❌ VK auto import: техническая ошибка при обработке поста\n{source_url}\n{exc}",
-                            disable_web_page_preview=True,
-                        )
-                    except Exception:
-                        pass
+                await _await_process_task(
+                    post_obj=post,
+                    source_url=source_url,
+                    process_task=process_task,
+                )
 
                 post = next_post
                 prefetch_task = next_prefetch_task
@@ -1442,28 +1493,11 @@ async def run_vk_auto_import(
                     )
                     next_prefetch_task = _start_prefetch(next_post) if next_post else None
 
-                try:
-                    await process_task
-                except Exception as exc:
-                    report.inbox_failed += 1
-                    report.errors.append(f"unexpected_failed {source_url}: {exc}")
-                    try:
-                        await vk_review.mark_failed(db, int(post.id))
-                    except Exception:
-                        logger.warning("vk_auto: mark_failed failed after exception", exc_info=True)
-                    logger.exception(
-                        "vk_auto: unexpected exception in inbox row processing id=%s url=%s",
-                        getattr(post, "id", None),
-                        source_url,
-                    )
-                    try:
-                        await bot.send_message(
-                            chat_id,
-                            f"❌ VK auto import: техническая ошибка при обработке поста\n{source_url}\n{exc}",
-                            disable_web_page_preview=True,
-                        )
-                    except Exception:
-                        pass
+                await _await_process_task(
+                    post_obj=post,
+                    source_url=source_url,
+                    process_task=process_task,
+                )
 
                 post = next_post
                 prefetch_task = next_prefetch_task

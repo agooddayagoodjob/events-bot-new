@@ -47,6 +47,7 @@ If you see skip notifications in admin chat often, spread the schedules further 
 
 Skipped heavy-job attempts are now also written to `ops_run.status='skipped'` (with a reason), so `/general_stats` can show that the scheduler tried to start a job but skipped it before the job body ran.
 Scheduled `vk_auto_import` and `tg_monitoring` entrypoints also create a bootstrap `ops_run` before resolving superadmin / entering the inner runner, so a 1ms APScheduler fire can no longer disappear without either a real run row or an explicit `skipped/error` record.
+Scheduled guide slots now also participate in the shared heavy-job guard at the scheduler layer: if another heavy job (for example a stuck `vk_auto_import`) already owns the gate, the guide slot records `ops_run(kind='guide_monitoring', status='skipped', skip_reason='heavy_busy')` instead of waiting invisibly before `run_guide_monitor()` can materialize its own run.
 `tg_monitoring` and `vk_auto_import` are additionally protected by a critical-run catch-up path: their APScheduler misfire grace is longer than the generic 30s default, the scheduler performs startup catch-up for the last missed slot within the configured lookback window, and a live watchdog re-checks `ops_run` after the slot. If APScheduler emits `JOB_SUBMITTED`/`JOB_MISSED` but the entrypoint never writes a materialized run, the watchdog dispatches the same scheduled entrypoint with a catch-up `run_id` instead of waiting for the next day/slot. These two jobs use `wait` as their default heavy-job guard mode so a nearby critical run queues behind an existing heavy operation instead of silently skipping, unless `SCHED_HEAVY_GUARD_MODE` explicitly overrides it.
 
 For admin-facing scheduled reports, the bot now resolves the target chat from the superadmin row in SQLite first; `ADMIN_CHAT_ID` is only a bootstrap/legacy fallback.
@@ -167,6 +168,7 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 - `ENABLE_VK_AUTO_IMPORT` – enable VK inbox auto import job.
 - `VK_AUTO_IMPORT_TIMES_LOCAL` / `VK_AUTO_IMPORT_TZ` – VK auto-import schedule times in local time zone.
 - `VK_AUTO_IMPORT_LIMIT` – max number of VK inbox rows to process per scheduled run (default `15`).
+- `VK_AUTO_IMPORT_ROW_TIMEOUT_SEC` – max seconds per VK inbox row before auto-import marks that post as `failed` and continues with the next row (default `1800`; set `<=0` to disable).
 - `VK_AUTO_IMPORT_MISFIRE_GRACE_SECONDS` – per-job APScheduler misfire window for VK auto-import (default: `1800`).
 - `VK_AUTO_IMPORT_CATCHUP_LOOKBACK_SECONDS` – startup/watchdog lookback for the last missed VK auto-import slot (default: `86400`).
 - `CRITICAL_SCHED_WATCHDOG_GRACE_SECONDS` / `CRITICAL_SCHED_WATCHDOG_INTERVAL_SECONDS` – live watchdog grace and polling interval for critical scheduled jobs (`tg_monitoring`, `vk_auto_import`; defaults: `300` / `60` seconds).

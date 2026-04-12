@@ -1271,6 +1271,8 @@ _VIDEO_TOMORROW_EXISTING_SESSION_STATUSES: set[str] = {
 _HEAVY_JOB_IDS: set[str] = {
     "tg_monitoring",
     "vk_auto_import",
+    "guide_excursions_light",
+    "guide_excursions_full",
     "source_parsing",
     "source_parsing_day",
     "festival_queue",
@@ -1281,6 +1283,8 @@ _HEAVY_JOB_IDS: set[str] = {
 
 _OPS_RUN_KIND_BY_JOB_ID: dict[str, str] = {
     "3di_scheduler": "3di",
+    "guide_excursions_light": "guide_monitoring",
+    "guide_excursions_full": "guide_monitoring",
     "source_parsing": "parse",
     "source_parsing_day": "parse",
 }

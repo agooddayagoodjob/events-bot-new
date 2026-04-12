@@ -152,6 +152,7 @@ ENV:
 - `VK_AUTO_IMPORT_INLINE_JOBS` (по умолчанию `1`) ждать inline-джобы для отчёта (Telegraph/ICS).
 - `VK_AUTO_IMPORT_INLINE_INCLUDE_ICS` (по умолчанию `0`) ждать ICS inline вместе с Telegraph (обычно не нужно для E2E/local).
 - `VK_AUTO_IMPORT_SLOW_ROW_LOG_SEC` (по умолчанию `60`) порог для автоматического stage timing log по одной строке очереди даже без `PIPELINE_TIMINGS=1`; `0` означает логировать все строки.
+- `VK_AUTO_IMPORT_ROW_TIMEOUT_SEC` (по умолчанию `1800`) жёсткий ceiling на один пост очереди; если обработка одного VK row зависла дольше лимита, строка помечается как `failed`, оператор получает timeout-сообщение, а run продолжает следующий пост. Значение `<=0` отключает guard.
 
 Плановый отчёт scheduler отправляется в чат superadmin из БД (`user.is_superadmin=1`). `ADMIN_CHAT_ID` больше не нужен для штатной работы и используется только как legacy fallback до регистрации superadmin в БД.
 

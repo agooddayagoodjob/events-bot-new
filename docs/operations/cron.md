@@ -103,6 +103,7 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 
 - Fly probes `GET /healthz` every 15 seconds.
 - `/healthz` no longer returns a blind static `ok`: it verifies that startup completed, the runtime heartbeat is fresh, required background tasks (`daily_scheduler`, `add_event_watch`, and `job_outbox_worker` when enabled) are alive, the bot session is open, and SQLite answers `SELECT 1`.
+- The same applies to scheduler watchdog hooks: if `video_tomorrow` or critical scheduler watchdog support is enabled in runtime, `create_app()` must import the matching `scheduler_*_watchdog_*` callables from `scheduling.py`; a missing import is a production defect because it turns `/healthz` into `500` and silently disables watchdog ticks instead of degrading to a normal `503` health report.
 - `add_event_watch` is allowed to restart a stalled add-event worker in place; the watchdog now updates the shared dequeue timestamp correctly instead of tripping an `UnboundLocalError` during stall recovery and poisoning `/healthz`.
 - If any of those checks fail, `/healthz` returns `503` with a JSON payload describing the failing component. This lets Fly recycle machines that are still serving HTTP but stopped processing Telegram webhooks or scheduler loops correctly.
 

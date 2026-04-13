@@ -464,6 +464,11 @@ def test_create_app_requires_webhook_url(monkeypatch):
     assert app is not None
 
 
+def test_scheduler_watchdog_symbols_are_imported():
+    assert callable(main.scheduler_critical_watchdog_tick)
+    assert callable(main.scheduler_critical_watchdog_enabled)
+
+
 @pytest.mark.asyncio
 async def test_add_event_raw(tmp_path: Path, monkeypatch):
     db = Database(str(tmp_path / "db.sqlite"))
@@ -11227,4 +11232,3 @@ async def test_progress_includes_festival_tg(tmp_path: Path, monkeypatch):
     await main.publish_event_progress(ev, db, bot, chat_id=1)
     final_text = bot.text_edits[-1][2]
     assert "✅ Telegraph (фестиваль) — http://fest" in final_text
-

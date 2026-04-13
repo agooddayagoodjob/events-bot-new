@@ -774,6 +774,12 @@ def _critical_job_misfire_grace_seconds(kind: str) -> int:
             default=1800,
             minimum=30,
         )
+    if kind == "guide_monitoring":
+        return _env_int_seconds(
+            "GUIDE_MONITORING_MISFIRE_GRACE_SECONDS",
+            default=1800,
+            minimum=30,
+        )
     if kind == "vk_auto_import":
         return _env_int_seconds(
             "VK_AUTO_IMPORT_MISFIRE_GRACE_SECONDS",
@@ -790,6 +796,12 @@ def _critical_job_catchup_lookback_seconds(kind: str) -> int:
             default=24 * 3600,
             minimum=3600,
         )
+    if kind == "guide_monitoring":
+        return _env_int_seconds(
+            "GUIDE_MONITORING_CATCHUP_LOOKBACK_SECONDS",
+            default=24 * 3600,
+            minimum=3600,
+        )
     if kind == "vk_auto_import":
         return _env_int_seconds(
             "VK_AUTO_IMPORT_CATCHUP_LOOKBACK_SECONDS",
@@ -802,8 +814,9 @@ def _critical_job_catchup_lookback_seconds(kind: str) -> int:
 def critical_scheduler_watchdog_enabled() -> bool:
     is_prod = os.getenv("DEV_MODE") != "1" and os.getenv("PYTEST_CURRENT_TEST") is None
     tg_enabled = _env_enabled("ENABLE_TG_MONITORING", default=is_prod)
+    guide_enabled = _env_enabled("ENABLE_GUIDE_EXCURSIONS_SCHEDULED", default=False)
     vk_enabled = _env_enabled("ENABLE_VK_AUTO_IMPORT", default=False)
-    return tg_enabled or vk_enabled
+    return tg_enabled or guide_enabled or vk_enabled
 
 
 def _critical_schedule_specs(*, is_prod: bool | None = None) -> list[dict[str, Any]]:
@@ -821,6 +834,22 @@ def _critical_schedule_specs(*, is_prod: bool | None = None) -> list[dict[str, A
                 "default_hour": 23,
                 "default_minute": 40,
                 "label": "TG_MONITORING_TIME_LOCAL",
+            }
+        )
+    if _env_enabled("ENABLE_GUIDE_EXCURSIONS_SCHEDULED", default=False):
+        specs.append(
+            {
+                "kind": "guide_monitoring",
+                "job_id": "guide_excursions_full",
+                "times": [
+                    os.getenv("GUIDE_EXCURSIONS_FULL_TIME_LOCAL", "20:10").strip()
+                    or "20:10"
+                ],
+                "tz": os.getenv("GUIDE_EXCURSIONS_TZ", "Europe/Kaliningrad").strip()
+                or "Europe/Kaliningrad",
+                "default_hour": 20,
+                "default_minute": 10,
+                "label": "GUIDE_EXCURSIONS_FULL_TIME_LOCAL",
             }
         )
     if _env_enabled("ENABLE_VK_AUTO_IMPORT", default=False):
@@ -922,7 +951,7 @@ async def _critical_slot_has_materialized_run(
     async with db.raw_conn() as conn:
         cur = await conn.execute(
             """
-            SELECT status
+            SELECT status, details_json
             FROM ops_run
             WHERE kind = ?
               AND trigger = 'scheduled'
@@ -938,8 +967,22 @@ async def _critical_slot_has_materialized_run(
                 _utc_sql_text(slot.next_scheduled_utc),
             ),
         )
-        row = await cur.fetchone()
-    return bool(row)
+        rows = await cur.fetchall()
+    for _status, details_json in rows:
+        if slot.job_id != "guide_excursions_full":
+            return True
+        details: dict[str, Any] = {}
+        raw_details = str(details_json or "").strip()
+        if raw_details:
+            try:
+                parsed = json.loads(raw_details)
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, dict):
+                details = parsed
+        if str(details.get("mode") or "").strip().lower() == "full":
+            return True
+    return False
 
 
 async def _dispatch_critical_scheduled_slot(
@@ -972,10 +1015,15 @@ async def _dispatch_critical_scheduled_slot(
             from source_parsing.telegram.service import telegram_monitor_scheduler
 
             scheduler_func = telegram_monitor_scheduler
+            scheduler_kwargs = {"run_id": run_id}
+        elif slot.kind == "guide_monitoring":
+            scheduler_func = _run_scheduled_guide_excursions
+            scheduler_kwargs = {"mode": "full"}
         elif slot.kind == "vk_auto_import":
             from vk_auto_queue import vk_auto_import_scheduler
 
             scheduler_func = vk_auto_import_scheduler
+            scheduler_kwargs = {"run_id": run_id}
         else:
             logging.warning("SCHED %s unknown critical slot kind=%s", source, slot.kind)
             return False
@@ -987,7 +1035,7 @@ async def _dispatch_critical_scheduled_slot(
             run_id=run_id,
             operator_id=0,
         ):
-            await scheduler_func(db, bot, run_id=run_id)
+            await scheduler_func(db, bot, **scheduler_kwargs)
         _critical_catchup_completed.add(memory_key)
         return True
     finally:

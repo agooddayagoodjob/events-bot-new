@@ -48,7 +48,9 @@ If you see skip notifications in admin chat often, spread the schedules further 
 Skipped heavy-job attempts are now also written to `ops_run.status='skipped'` (with a reason), so `/general_stats` can show that the scheduler tried to start a job but skipped it before the job body ran.
 Scheduled `vk_auto_import` and `tg_monitoring` entrypoints also create a bootstrap `ops_run` before resolving superadmin / entering the inner runner, so a 1ms APScheduler fire can no longer disappear without either a real run row or an explicit `skipped/error` record.
 Scheduled guide slots now also participate in the shared heavy-job guard at the scheduler layer: if another heavy job (for example a stuck `vk_auto_import`) already owns the gate, the guide slot records `ops_run(kind='guide_monitoring', status='skipped', skip_reason='heavy_busy')` instead of waiting invisibly before `run_guide_monitor()` can materialize its own run.
-`tg_monitoring` and `vk_auto_import` are additionally protected by a critical-run catch-up path: their APScheduler misfire grace is longer than the generic 30s default, the scheduler performs startup catch-up for the last missed slot within the configured lookback window, and a live watchdog re-checks `ops_run` after the slot. If APScheduler emits `JOB_SUBMITTED`/`JOB_MISSED` but the entrypoint never writes a materialized run, the watchdog dispatches the same scheduled entrypoint with a catch-up `run_id` instead of waiting for the next day/slot. These two jobs use `wait` as their default heavy-job guard mode so a nearby critical run queues behind an existing heavy operation instead of silently skipping, unless `SCHED_HEAVY_GUARD_MODE` explicitly overrides it.
+`tg_monitoring`, scheduled `guide_excursions_full`, and `vk_auto_import` are additionally protected by a critical-run catch-up path: their APScheduler misfire grace is longer than the generic 30s default, the scheduler performs startup catch-up for the last missed slot within the configured lookback window, and a live watchdog re-checks `ops_run` after the slot. If APScheduler emits `JOB_SUBMITTED`/`JOB_MISSED` but the entrypoint never writes a materialized run, the watchdog dispatches the same scheduled entrypoint with a catch-up `run_id` instead of waiting for the next day/slot.
+For `guide_excursions_full`, the watchdog only treats a materialized `ops_run(kind='guide_monitoring', details.mode='full')` as delivery; a same-day `light` scan must not suppress recovery of the missed `full` auto-publish slot.
+`tg_monitoring` and `vk_auto_import` use `wait` as their default heavy-job guard mode so a nearby critical run queues behind an existing heavy operation instead of silently skipping, unless `SCHED_HEAVY_GUARD_MODE` explicitly overrides it. `guide_excursions_full` still records the initial `heavy_busy` skip, but its catch-up dispatch uses the same `wait` semantics so the missed daily digest runs as soon as the blocking heavy job releases the gate.
 
 For admin-facing scheduled reports, the bot now resolves the target chat from the superadmin row in SQLite first; `ADMIN_CHAT_ID` is only a bootstrap/legacy fallback.
 
@@ -79,6 +81,7 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 - перед `push` мониторинг проверяет shared remote Telegram session guard по `kaggle_registry`; если другой Telegram-based Kaggle job ещё жив или его status lookup не дал надёжного ответа, текущий run фиксируется как `skipped` вместо запуска второй удалённой Telethon session.
 - **Guide excursions monitoring** – scheduled guide-only Kaggle scans when `ENABLE_GUIDE_EXCURSIONS_SCHEDULED=1`.
   - if `ENABLE_GUIDE_DIGEST_SCHEDULED=1`, the same successful `full` run immediately publishes `new_occurrences` after server-side import instead of using a separate cron slot.
+  - the `full` slot is also part of the critical scheduler catch-up path: after a `heavy_busy` skip or missed APScheduler fire, startup catch-up and the live watchdog replay the same scheduled `full` path within the configured lookback window instead of dropping the day.
   - guide path использует тот же shared guard и при конфликте remote session завершает слот как `skipped` с явной диагностикой, а не падает в неявный `AuthKeyDuplicatedError`.
 - **Video announce `/v tomorrow`** – optional scheduled automatic `/v` run when `ENABLE_V_TOMORROW_SCHEDULED=1` (legacy alias: `ENABLE_V_TEST_TOMORROW_SCHEDULED=1`).
   - canonical mode is production: it uses `VideoAnnounceScenario.run_tomorrow_pipeline(... test_mode=False)`;
@@ -134,6 +137,8 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 - `TG_MONITORING_CATCHUP_LOOKBACK_SECONDS` – startup/watchdog lookback for the last missed Telegram monitoring slot (default: `86400`).
 - `ENABLE_GUIDE_EXCURSIONS_SCHEDULED` – enable guide-only scheduled scans.
 - `GUIDE_EXCURSIONS_LIGHT_TIMES_LOCAL` / `GUIDE_EXCURSIONS_FULL_TIME_LOCAL` / `GUIDE_EXCURSIONS_TZ` – guide monitoring light/full schedule in local time zone.
+- `GUIDE_MONITORING_MISFIRE_GRACE_SECONDS` – per-job APScheduler misfire window for the critical scheduled `full` guide slot (default: `1800`).
+- `GUIDE_MONITORING_CATCHUP_LOOKBACK_SECONDS` – startup/watchdog lookback for the last missed critical `full` guide slot (default: `86400`).
 - `ENABLE_GUIDE_DIGEST_SCHEDULED` – after a successful scheduled `full` guide scan, automatically publish the `new_occurrences` digest in the same job instead of a separate cron slot.
 - `ENABLE_V_TOMORROW_SCHEDULED` – enable scheduled automatic `/v` run for tomorrow (`ENABLE_V_TEST_TOMORROW_SCHEDULED` remains a legacy alias).
 - `V_TOMORROW_TIME_LOCAL` / `V_TOMORROW_TZ` – local schedule for automatic `/v` run. When `ENABLE_V_TOMORROW_SCHEDULED=1`, these canonical vars own the slot; `V_TEST_TOMORROW_*` remain legacy aliases only for legacy-enabled envs.
@@ -175,7 +180,7 @@ For admin-facing scheduled reports, the bot now resolves the target chat from th
 - `VK_AUTO_IMPORT_ROW_TIMEOUT_SEC` – max seconds per VK inbox row before auto-import marks that post as `failed` and continues with the next row (default `1800`; set `<=0` to disable).
 - `VK_AUTO_IMPORT_MISFIRE_GRACE_SECONDS` – per-job APScheduler misfire window for VK auto-import (default: `1800`).
 - `VK_AUTO_IMPORT_CATCHUP_LOOKBACK_SECONDS` – startup/watchdog lookback for the last missed VK auto-import slot (default: `86400`).
-- `CRITICAL_SCHED_WATCHDOG_GRACE_SECONDS` / `CRITICAL_SCHED_WATCHDOG_INTERVAL_SECONDS` – live watchdog grace and polling interval for critical scheduled jobs (`tg_monitoring`, `vk_auto_import`; defaults: `300` / `60` seconds).
+- `CRITICAL_SCHED_WATCHDOG_GRACE_SECONDS` / `CRITICAL_SCHED_WATCHDOG_INTERVAL_SECONDS` – live watchdog grace and polling interval for critical scheduled jobs (`tg_monitoring`, `guide_excursions_full`, `vk_auto_import`; defaults: `300` / `60` seconds).
 - `ENABLE_KAGGLE_RECOVERY` – enable background Kaggle recovery loop.
 - `KAGGLE_RECOVERY_INTERVAL_MINUTES` – recovery interval in minutes (default: 5).
 - `KAGGLE_JOBS_PATH` – path to Kaggle recovery registry JSON (default: `/data/kaggle_jobs.json`).

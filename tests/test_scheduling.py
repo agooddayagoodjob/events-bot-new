@@ -224,6 +224,26 @@ def _configure_video_tomorrow_env(monkeypatch) -> None:
     monkeypatch.setattr(scheduling, "datetime", _FixedVideoTomorrowDatetime)
 
 
+class _FixedCriticalSchedulerDatetime(datetime):
+    fixed_now = datetime(2026, 4, 13, 21, 5, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        value = cls.fixed_now
+        if tz is not None:
+            return value.astimezone(tz)
+        return value.replace(tzinfo=None)
+
+
+def _configure_guide_critical_env(monkeypatch) -> None:
+    monkeypatch.setenv("ENABLE_GUIDE_EXCURSIONS_SCHEDULED", "1")
+    monkeypatch.setenv("GUIDE_EXCURSIONS_TZ", "Europe/Kaliningrad")
+    monkeypatch.setenv("GUIDE_EXCURSIONS_FULL_TIME_LOCAL", "20:10")
+    monkeypatch.delenv("CRITICAL_SCHED_WATCHDOG_GRACE_SECONDS", raising=False)
+    monkeypatch.delenv("GUIDE_MONITORING_MISFIRE_GRACE_SECONDS", raising=False)
+    monkeypatch.setattr(scheduling, "datetime", _FixedCriticalSchedulerDatetime)
+
+
 @pytest.mark.asyncio
 async def test_video_tomorrow_startup_catchup_retries_single_recoverable_failed_session(
     tmp_path, monkeypatch
@@ -349,4 +369,101 @@ async def test_video_tomorrow_startup_catchup_skips_second_recoverable_retry_sam
     )
 
     assert dispatched is False
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_critical_scheduler_watchdog_dispatches_guide_full_after_light_run_only(
+    tmp_path, monkeypatch
+):
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.init()
+    _configure_guide_critical_env(monkeypatch)
+    scheduling._critical_catchup_inflight.clear()
+    scheduling._critical_catchup_completed.clear()
+
+    run_id = await start_ops_run(
+        db,
+        kind="guide_monitoring",
+        trigger="scheduled",
+        operator_id=0,
+        started_at=datetime(2026, 4, 13, 18, 20, tzinfo=timezone.utc),
+        details={"mode": "light"},
+    )
+    await finish_ops_run(
+        db,
+        run_id=run_id,
+        status="success",
+        finished_at=datetime(2026, 4, 13, 18, 27, tzinfo=timezone.utc),
+        details={"mode": "light"},
+    )
+
+    calls: list[dict[str, str]] = []
+
+    async def fake_run(_db, _bot, *, mode: str) -> None:
+        calls.append({"mode": mode})
+
+    @asynccontextmanager
+    async def fake_heavy_operation(**kwargs):
+        calls.append({"kind": kwargs["kind"], "guard": kwargs["mode"]})
+        yield
+
+    monkeypatch.setattr(scheduling, "_run_scheduled_guide_excursions", fake_run)
+    monkeypatch.setattr(scheduling, "heavy_operation", fake_heavy_operation)
+
+    dispatched = await scheduling.maybe_dispatch_critical_scheduler_watchdog(
+        db, bot=object()
+    )
+
+    assert dispatched == 1
+    assert calls == [
+        {"kind": "guide_monitoring", "guard": "wait"},
+        {"mode": "full"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_critical_scheduler_watchdog_skips_guide_when_full_run_exists(
+    tmp_path, monkeypatch
+):
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.init()
+    _configure_guide_critical_env(monkeypatch)
+    scheduling._critical_catchup_inflight.clear()
+    scheduling._critical_catchup_completed.clear()
+
+    run_id = await start_ops_run(
+        db,
+        kind="guide_monitoring",
+        trigger="scheduled",
+        operator_id=0,
+        started_at=datetime(2026, 4, 13, 18, 20, tzinfo=timezone.utc),
+        details={"mode": "full"},
+    )
+    await finish_ops_run(
+        db,
+        run_id=run_id,
+        status="success",
+        finished_at=datetime(2026, 4, 13, 18, 27, tzinfo=timezone.utc),
+        details={"mode": "full"},
+    )
+
+    calls: list[dict[str, str]] = []
+
+    async def fake_run(_db, _bot, *, mode: str) -> None:
+        calls.append({"mode": mode})
+
+    @asynccontextmanager
+    async def fake_heavy_operation(**kwargs):
+        calls.append({"kind": kwargs["kind"], "guard": kwargs["mode"]})
+        yield
+
+    monkeypatch.setattr(scheduling, "_run_scheduled_guide_excursions", fake_run)
+    monkeypatch.setattr(scheduling, "heavy_operation", fake_heavy_operation)
+
+    dispatched = await scheduling.maybe_dispatch_critical_scheduler_watchdog(
+        db, bot=object()
+    )
+
+    assert dispatched == 0
     assert calls == []

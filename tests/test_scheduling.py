@@ -467,3 +467,76 @@ async def test_critical_scheduler_watchdog_skips_guide_when_full_run_exists(
 
     assert dispatched == 0
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_critical_scheduler_watchdog_retries_guide_after_remote_busy_skip(
+    tmp_path, monkeypatch
+):
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.init()
+    _configure_guide_critical_env(monkeypatch)
+    scheduling._critical_catchup_inflight.clear()
+    scheduling._critical_catchup_completed.clear()
+
+    calls: list[dict[str, str]] = []
+
+    async def fake_run(_db, _bot, *, mode: str) -> None:
+        calls.append({"mode": mode})
+        run_id = await start_ops_run(
+            db,
+            kind="guide_monitoring",
+            trigger="scheduled",
+            operator_id=0,
+            started_at=datetime(2026, 4, 13, 18, 20, tzinfo=timezone.utc),
+            details={
+                "mode": "full",
+                "errors": ["remote_telegram_session_busy: tg_monitoring"],
+                "remote_telegram_session_conflicts": [
+                    {
+                        "job_type": "tg_monitoring",
+                        "kernel_ref": "zigomaro/telegram-monitor-bot",
+                    }
+                ],
+            },
+        )
+        await finish_ops_run(
+            db,
+            run_id=run_id,
+            status="skipped",
+            finished_at=datetime(2026, 4, 13, 18, 21, tzinfo=timezone.utc),
+            details={
+                "mode": "full",
+                "errors": ["remote_telegram_session_busy: tg_monitoring"],
+                "remote_telegram_session_conflicts": [
+                    {
+                        "job_type": "tg_monitoring",
+                        "kernel_ref": "zigomaro/telegram-monitor-bot",
+                    }
+                ],
+            },
+        )
+
+    @asynccontextmanager
+    async def fake_heavy_operation(**kwargs):
+        calls.append({"kind": kwargs["kind"], "guard": kwargs["mode"]})
+        yield
+
+    monkeypatch.setattr(scheduling, "_run_scheduled_guide_excursions", fake_run)
+    monkeypatch.setattr(scheduling, "heavy_operation", fake_heavy_operation)
+
+    first_dispatched = await scheduling.maybe_dispatch_critical_scheduler_watchdog(
+        db, bot=object()
+    )
+    second_dispatched = await scheduling.maybe_dispatch_critical_scheduler_watchdog(
+        db, bot=object()
+    )
+
+    assert first_dispatched == 1
+    assert second_dispatched == 1
+    assert calls == [
+        {"kind": "guide_monitoring", "guard": "wait"},
+        {"mode": "full"},
+        {"kind": "guide_monitoring", "guard": "wait"},
+        {"mode": "full"},
+    ]

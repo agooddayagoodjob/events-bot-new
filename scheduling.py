@@ -1036,7 +1036,15 @@ async def _dispatch_critical_scheduled_slot(
             operator_id=0,
         ):
             await scheduler_func(db, bot, **scheduler_kwargs)
-        _critical_catchup_completed.add(memory_key)
+        if await _critical_slot_has_materialized_run(db, slot):
+            _critical_catchup_completed.add(memory_key)
+        else:
+            logging.warning(
+                "SCHED %s leaving %s slot pending after dispatch scheduled_utc=%s",
+                source,
+                slot.kind,
+                slot.scheduled_utc.isoformat(),
+            )
         return True
     finally:
         _critical_catchup_inflight.discard(memory_key)

@@ -103,10 +103,13 @@ Related docs: `docs/operations/incident-management.md`, `docs/operations/cron.md
 
 ## Release And Closure Evidence
 
-- deployed SHA: pending hotfix deploy
+- deployed SHA: `ce502b6f3c6734d3465112a2373b06054ef81460`
 - deploy path: clean `hotfix` worktree from `origin/main`
-- regression checks: see `Mandatory checks before closure or deploy`
-- post-deploy verification: pending
+- regression checks: `pytest -q tests/test_vk_review.py tests/test_vk_auto_queue_import.py tests/test_vk_actor.py tests/test_ops_run.py tests/test_vk_auto_queue_rate_limit.py tests/test_vk_review_lock_retry.py` → `55 passed`
+- post-deploy verification:
+  - `flyctl status -a events-bot-new-wngqia` → machine `48e42d5b714228`, version `945`, state `started`
+  - `GET https://events-bot-new-wngqia.fly.dev/healthz` → `{"ok":true,"ready":true,...,"db":"ok","issues":[]}`
+  - fresh Fly logs after deploy show `BOOT_OK`, `daily_scheduler: done`, and no new `database is locked` entries in the post-deploy startup slice
 
 ## Prevention
 

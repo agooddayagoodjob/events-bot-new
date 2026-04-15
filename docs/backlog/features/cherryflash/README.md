@@ -575,6 +575,10 @@ This section captures the latest intro-direction request as an explicit delta to
   - target budget: the complete daily release with intro, `2..6` event scenes, and branded outro should fit within about `15 MB` for Telegram/Stories-style delivery;
   - final mode should therefore prefer `libx265` / HEVC with `hvc1` tagging, while local preview mode may keep `libx264` for faster iteration;
   - this compact publish profile is a delivery optimization on top of the direct image-sequence encode, not a replacement for source-frame validation.
+- Kaggle notebook bootstrap must tolerate transient third-party apt mirror incidents:
+  - CherryFlash setup must not fail the whole run because a non-essential external repo such as `cloud.r-project.org` is mid-sync during `apt-get update`;
+  - before installing the required runtime packages (`ffmpeg`, `libxrender1`, `libxi6`, `libxkbcommon-x11-0`), the notebook may disable that flaky CRAN source and retry `apt-get update` with explicit apt retry options;
+  - such bootstrap hardening is part of the renderability contract, because a run that never reaches the renderer due to a temporary mirror mismatch is still a failed CherryFlash release.
 
 ## Delivery contract
 

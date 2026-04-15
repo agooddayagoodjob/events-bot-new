@@ -19,11 +19,23 @@ def _cell_source(index: int) -> str:
 def test_cherryflash_notebook_installs_shared_story_helper_dependencies():
     source = _cell_source(0)
 
-    assert "NOTEBOOK_VERSION = 'v12-thread-safe-story-preflight'" in source
+    assert "NOTEBOOK_VERSION = 'v13-apt-resilient-hevc-final'" in source
     assert "'opencv-python'" in source
     assert "'requests'" in source
     assert "'telethon'" in source
     assert "'cryptography'" in source
+
+
+def test_cherryflash_notebook_hardens_apt_bootstrap_against_flaky_cran_repo():
+    source = _cell_source(0)
+
+    assert "def disable_flaky_apt_repos()" in source
+    assert "cloud.r-project.org/bin/linux/ubuntu/jammy-cran40" in source
+    assert "candidate.rename(disabled)" in source
+    assert "def apt_update_resilient()" in source
+    assert "'Acquire::Retries=3'" in source
+    assert "'Acquire::By-Hash=force'" in source
+    assert "apt_update_resilient()" in source
 
 
 def test_cherryflash_notebook_uses_common_story_publish_helper():

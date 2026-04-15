@@ -226,6 +226,7 @@ Target channels для manual/scheduled publish задаются через `GUI
 - если несколько published occurrences приходят из одного multi-announce source post, digest должен распределять разные `media_refs` по карточкам этого поста, а не повторять одну и ту же фотографию 3-4 раза подряд;
 - media selection не должна останавливаться на первых нескольких карточках без фото: runtime добирает media дальше по digest rows, пока не соберёт доступный album pack (до Telegram cap).
 - если preview выбрал карточки с `media_refs`, но usable materialized files для них отсутствуют, publish обязан завершаться с явной ошибкой; silent text-only fallback для guide digest не допускается.
+- service-only фразы вроде `Новых экскурсионных находок пока нет.` или `Сигналов last call пока нет.` не считаются публичным digest payload: при пустом наборе candidates runtime не публикует их в target channels и оставляет такие сообщения только для operator-facing surfaces.
 
 ## Terminology Policy
 
@@ -280,6 +281,7 @@ Guide digest не должен произвольно смешивать `про
 - `GUIDE_EXCURSIONS_FULL_TIME_LOCAL=20:10`
 - `GUIDE_EXCURSIONS_TZ=Europe/Kaliningrad`
 - `ENABLE_GUIDE_DIGEST_SCHEDULED=1` включает автопубликацию `new_occurrences` сразу после успешного scheduled `full` scan/import; отдельный cron для digest здесь намеренно не используется, чтобы не гадать длительность Kaggle run и не занимать ещё одно heavy-job окно.
+- если после scheduled `full` scan у `new_occurrences` нет candidates, scheduled publish должен завершаться bot-only служебным сообщением оператору (`новых экскурсионных находок нет`) без публикации пустого поста в каналы;
 - scheduled `full` slot считается critical daily slot: если первичный APScheduler fire пропущен или записался как `ops_run(... status='skipped', skip_reason='heavy_busy')`, startup catch-up и live watchdog обязаны догонять тот же scheduled `full` path в пределах lookback окна, а catch-up-dispatch ждёт освобождения heavy gate вместо тихого пропуска дня;
 - same-day `light` runs не считаются подтверждением доставки daily `full` slot: recovery должен искать materialized `guide_monitoring` именно с `details.mode='full'`, иначе вечерняя автопубликация может быть ложно признана “уже выполненной”.
 - если catch-up `full` run снова завершается `status='skipped'` только из-за занятого shared remote Telegram/Kaggle session (`remote_telegram_session_busy`), watchdog не должен считать такой dispatch завершением суточного слота: тот же scheduled `full` path обязан пробоваться снова на следующем watchdog tick, пока не materialize-ится не-skipped `full` run или не истечёт lookback окно.

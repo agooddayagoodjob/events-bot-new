@@ -127,6 +127,18 @@ async def _run_scheduled_guide_excursions(
             )
         except Exception:
             logging.exception("SCHED failed to notify admin about scheduled guide digest publish")
+    elif target_chat_id and publish_result.get("reason") == "no_items":
+        try:
+            await bot.send_message(
+                int(target_chat_id),
+                (
+                    "ℹ️ Scheduled guide digest: новых экскурсионных находок нет\n"
+                    f"issue_id={publish_result.get('issue_id')}"
+                ),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logging.exception("SCHED failed to notify admin about empty scheduled guide digest")
 
 
 async def _run_scheduled_video_tomorrow_test(

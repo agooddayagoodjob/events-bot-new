@@ -126,3 +126,93 @@ async def test_publish_guide_digest_uses_single_album_caption_when_text_fits(tmp
         if "UPDATE guide_occurrence SET published_new_digest_issue_id" in sql
     ]
     assert occurrence_updates == [(77, 101)]
+
+
+@pytest.mark.asyncio
+async def test_publish_guide_digest_keeps_empty_digest_bot_only(monkeypatch):
+    preview = {
+        "issue_id": 88,
+        "texts": ["Новых экскурсионных находок пока нет."],
+        "items": [],
+        "media_items": [],
+        "covered_occurrence_ids": [],
+    }
+
+    async def fake_build_preview(db, *, family, limit=24, run_id=None):
+        del db, family, limit, run_id
+        return preview
+
+    monkeypatch.setattr(guide_service, "build_guide_digest_preview", fake_build_preview)
+
+    class _FakeConn:
+        def __init__(self) -> None:
+            self.row_factory = None
+            self.executed: list[tuple[str, tuple[object, ...]]] = []
+
+        async def execute(self, sql, params=()):
+            self.executed.append((sql, tuple(params)))
+            return None
+
+        async def commit(self):
+            return None
+
+    class _FakeDB:
+        def __init__(self) -> None:
+            self.conn = _FakeConn()
+
+        @asynccontextmanager
+        async def raw_conn(self):
+            yield self.conn
+
+    class _DummyBot:
+        def __init__(self) -> None:
+            self.media_calls: list[tuple[str, list[object]]] = []
+            self.message_calls: list[tuple[str, str]] = []
+            self.caption_edits: list[tuple[str, int, str]] = []
+
+        async def send_media_group(self, chat_id, media):
+            self.media_calls.append((chat_id, list(media)))
+            return []
+
+        async def send_message(self, chat_id, text, **kwargs):
+            del kwargs
+            self.message_calls.append((chat_id, text))
+            raise AssertionError("empty guide digest must not publish into target chats")
+
+        async def edit_message_caption(self, chat_id, message_id, caption, **kwargs):
+            del kwargs
+            self.caption_edits.append((chat_id, message_id, caption))
+            raise AssertionError("empty guide digest must not edit target captions")
+
+    db = _FakeDB()
+    bot = _DummyBot()
+
+    result = await guide_service.publish_guide_digest(
+        db,
+        bot,
+        family="new_occurrences",
+        chat_id=123456,
+        target_chat="@digest_target",
+    )
+
+    assert result == {
+        "issue_id": 88,
+        "published": False,
+        "reason": "no_items",
+        "target_chat": "@digest_target",
+        "target_chats": ["@digest_target"],
+        "message_ids": [],
+        "text_message_ids": [],
+        "media_message_ids": [],
+    }
+    assert bot.media_calls == []
+    assert bot.message_calls == []
+    assert bot.caption_edits == []
+    assert any(
+        "UPDATE guide_digest_issue" in sql and params[0] == "empty" and params[1] == "@digest_target"
+        for sql, params in db.conn.executed
+    )
+    assert not any(
+        "UPDATE guide_occurrence SET published_new_digest_issue_id" in sql
+        for sql, _params in db.conn.executed
+    )

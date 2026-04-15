@@ -14,3 +14,10 @@ Feature: Guide excursions monitoring
     And the whole rendered digest fits into one safe Telegram caption
     When the digest is published
     Then the target channel receives one media album without a separate text follow-up post
+
+  Scenario: Empty scheduled guide digest stays bot-only
+    Given the scheduled full guide scan completed successfully
+    And there are no new digest-ready guide occurrences
+    When scheduled digest publication runs
+    Then the operator bot chat receives a service acknowledgement
+    And target channels do not receive an empty guide digest post

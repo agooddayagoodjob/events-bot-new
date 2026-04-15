@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- **Guide Excursions / Empty Digest Bot-Only Ack**: scheduled and manual guide digest publication no longer sends service-only `Новых экскурсионных находок пока нет.` / `Сигналов ... пока нет.` posts into target channels; empty issues are marked as `empty`, channel publish is skipped, and the operator gets a bot-only acknowledgement with the `issue_id` so automation still proves it ran.
+
 ### Added
 - **CherryFlash / `/v` One-Click Launch**: `/v` now exposes CherryFlash as a dedicated direct-launch button plus a separate channel-settings button, and both the direct callback and `vidstart:popular_review` route now dispatch straight into `run_popular_review_pipeline()` instead of falling back to the generic manual-selection session flow.
 - **Media Storage / Yandex Object Storage Posters**: server-side image uploads (`upload_images`, Telegraph cover mirrors, festival/source-page cover uploads) now prefer Yandex Object Storage when `YC_SA_BOT_STORAGE[_KEY]` is configured, Telegram Monitoring passes Yandex credentials into Kaggle, and managed-storage URL detection/cleanup now understand `storage.yandexcloud.net` while keeping legacy `supabase_url/supabase_path` field names for backward compatibility.

@@ -3534,8 +3534,42 @@ async def publish_guide_digest(
     preview = await build_guide_digest_preview(db, family=family)
     issue_id = int(preview["issue_id"])
     targets = list(_resolve_digest_target_chats(target_chat))
+    primary_target = targets[0] if targets else GUIDE_DIGEST_TARGET_CHAT
     texts: list[str] = list(preview["texts"])
     period_label = _digest_period_label_from_items(preview.get("items"))
+    if not preview.get("items"):
+        async with db.raw_conn() as conn:
+            await _enable_row_factory(conn)
+            await conn.execute(
+                """
+                UPDATE guide_digest_issue
+                SET
+                    status=?,
+                    target_chat=?,
+                    published_at=NULL,
+                    published_message_ids_json=?,
+                    published_targets_json=?
+                WHERE id=?
+                """,
+                (
+                    "empty",
+                    primary_target,
+                    _json_dump([]),
+                    _json_dump({}),
+                    issue_id,
+                ),
+            )
+            await conn.commit()
+        return {
+            "issue_id": issue_id,
+            "published": False,
+            "reason": "no_items",
+            "target_chat": primary_target,
+            "target_chats": targets,
+            "message_ids": [],
+            "text_message_ids": [],
+            "media_message_ids": [],
+        }
     if not texts:
         return {"issue_id": issue_id, "published": False, "reason": "empty"}
     inline_caption_text = _inline_digest_caption_text(texts)
@@ -3648,7 +3682,6 @@ async def publish_guide_digest(
         published_targets: Mapping[str, Mapping[str, Sequence[int]]],
         mark_occurrences: bool,
     ) -> None:
-        primary_target = targets[0] if targets else GUIDE_DIGEST_TARGET_CHAT
         primary_payload = published_targets.get(primary_target) or {}
         primary_message_ids = [int(v) for v in (primary_payload.get("message_ids") or [])]
         async with db.raw_conn() as conn:

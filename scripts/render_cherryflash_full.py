@@ -72,6 +72,7 @@ INTRO_END_FRAME = approval.INTRO_END_FRAME
 FINAL_CARD_DURATION = 3.5
 FINAL_CARD_FADE_IN = 0.3
 AUDIO_BITRATE = "192k"
+FIRST_PRIMARY_SCENE_START_LOCAL = approval.SCENE1_START_LOCAL
 FINAL_VIDEO_CODEC = "libx265"
 FINAL_VIDEO_TAG = "hvc1"
 FINAL_VIDEO_PRESET = "medium"
@@ -286,6 +287,7 @@ def _build_outro_strip(
 def _build_render_scenes(payload: dict) -> list[RenderScene]:
     scenes_data = payload.get("scenes") or []
     scenes: list[RenderScene] = []
+    first_primary_assigned = False
     for idx, raw_scene in enumerate(scenes_data, start=1):
         if not isinstance(raw_scene, dict):
             continue
@@ -300,6 +302,10 @@ def _build_render_scenes(payload: dict) -> list[RenderScene]:
                 break
         if image_path is None:
             continue
+        start_local = 0.0
+        if scene_variant == "primary" and not first_primary_assigned:
+            start_local = FIRST_PRIMARY_SCENE_START_LOCAL
+            first_primary_assigned = True
         scenes.append(
             RenderScene(
                 index=idx,
@@ -316,7 +322,7 @@ def _build_render_scenes(payload: dict) -> list[RenderScene]:
                 ),
                 description=_scene_description(raw_scene),
                 image_path=image_path,
-                start_local=0.0,
+                start_local=start_local,
             )
         )
     final_card_path = _resolve_final_card_path()

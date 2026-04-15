@@ -71,7 +71,7 @@ def test_build_render_scenes_appends_final_card(
     )
 
     assert [scene.variant for scene in scenes] == ["primary", "brand_outro"]
-    assert scenes[0].start_local == 0.0
+    assert scenes[0].start_local == full.FIRST_PRIMARY_SCENE_START_LOCAL
     assert scenes[-1].image_path == tmp_path / "Final.png"
 
 
@@ -108,7 +108,56 @@ def test_build_render_scenes_keeps_full_timing_for_all_primary_scenes(
 
     primary_scenes = [scene for scene in scenes if scene.variant == "primary"]
     assert len(primary_scenes) == 2
-    assert {scene.start_local for scene in primary_scenes} == {0.0}
+    assert primary_scenes[0].start_local == full.FIRST_PRIMARY_SCENE_START_LOCAL
+    assert primary_scenes[1].start_local == 0.0
+
+
+def test_build_render_scenes_keeps_followup_and_later_primary_scenes_full_contract(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _write_frame(tmp_path / "scene1.png", (255, 255, 255, 255))
+    _write_frame(tmp_path / "scene2.png", (240, 240, 240, 255))
+    _write_frame(tmp_path / "followup.png", (230, 230, 230, 255))
+    _write_frame(tmp_path / "Final.png", (255, 255, 0, 255))
+
+    monkeypatch.setattr(full, "ROOT", tmp_path)
+
+    scenes = full._build_render_scenes(
+        {
+            "scenes": [
+                {
+                    "title": "Scene 1",
+                    "about": "Scene 1",
+                    "date": "12 апреля",
+                    "location": "Калининград",
+                    "images": ["scene1.png"],
+                },
+                {
+                    "title": "Followup",
+                    "about": "Followup",
+                    "scene_variant": "followup_image",
+                    "date": "12 апреля",
+                    "location": "Калининград",
+                    "images": ["followup.png"],
+                },
+                {
+                    "title": "Scene 2",
+                    "about": "Scene 2",
+                    "date": "13 апреля",
+                    "location": "Светлогорск",
+                    "images": ["scene2.png"],
+                },
+            ]
+        }
+    )
+
+    assert scenes[0].variant == "primary"
+    assert scenes[0].start_local == full.FIRST_PRIMARY_SCENE_START_LOCAL
+    assert scenes[1].variant == "followup_image"
+    assert scenes[1].start_local == 0.0
+    assert scenes[2].variant == "primary"
+    assert scenes[2].start_local == 0.0
 
 
 def test_build_render_scenes_formats_viewer_facing_date_and_location(

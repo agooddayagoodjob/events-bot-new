@@ -1353,8 +1353,20 @@ class VideoAnnounceScenario:
             "selected_required_period": None,
             "random_order": False,
             "allow_empty_ocr": False,
-            "story_publish_enabled": False,
+            "story_publish_enabled": True,
             "story_publish_mode": "video",
+            "story_targets_override": [
+                {
+                    "peer": "@kenigevents",
+                    "delay_seconds": 0,
+                    "mode": "upload",
+                },
+                {
+                    "peer": "@lovekenig",
+                    "delay_seconds": 600,
+                    "mode": "repost_previous",
+                },
+            ],
             "intro_text": POPULAR_REVIEW_INTRO_TEXT,
             "intro_text_valid": True,
         }

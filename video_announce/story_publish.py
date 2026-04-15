@@ -33,12 +33,14 @@ class StoryTarget:
     peer: str
     label: str
     delay_seconds: int = 0
+    mode: str = "upload"
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "peer": self.peer,
             "label": self.label,
             "delay_seconds": self.delay_seconds,
+            "mode": self.mode,
         }
 
 
@@ -145,6 +147,14 @@ def _story_session_payload() -> dict[str, Any]:
         "api_id": int(api_id),
         "api_hash": str(api_hash),
     }
+    raw_source_channel_id = (_get_env_value("SOURCE_CHANNEL_ID") or "").strip()
+    if raw_source_channel_id:
+        try:
+            auth["source_channel_id"] = int(raw_source_channel_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid SOURCE_CHANNEL_ID={raw_source_channel_id!r}: expected int"
+            ) from exc
     if bundle_env_key:
         bundle_raw = _get_env_value(bundle_env_key)
         if not bundle_raw:
@@ -310,6 +320,7 @@ def _parse_targets_json_env(env_key: str) -> list[StoryTarget]:
             peer = _normalize_peer(item)
             label = peer or f"extra-{idx + 1}"
             delay_seconds = 0
+            mode = "upload"
         elif isinstance(item, dict):
             peer = _normalize_peer(str(item.get("peer") or item.get("target") or ""))
             label = str(item.get("label") or peer or f"extra-{idx + 1}")
@@ -319,12 +330,19 @@ def _parse_targets_json_env(env_key: str) -> list[StoryTarget]:
                 raise RuntimeError(
                     f"{env_key}[{idx}].delay_seconds must be int"
                 ) from exc
+            raw_mode = str(item.get("mode") or item.get("publish_mode") or "upload").strip().lower()
+            mode = raw_mode if raw_mode in {"upload", "repost_previous"} else "upload"
         else:
             raise RuntimeError(f"{env_key} items must be strings or objects")
         if not peer:
             raise RuntimeError(f"{env_key}[{idx}] is missing peer/target")
         targets.append(
-            StoryTarget(peer=peer, label=label.strip() or peer, delay_seconds=delay_seconds)
+            StoryTarget(
+                peer=peer,
+                label=label.strip() or peer,
+                delay_seconds=delay_seconds,
+                mode=mode,
+            )
         )
     return targets
 
@@ -335,6 +353,47 @@ def _parse_story_targets_json() -> list[StoryTarget]:
 
 def _parse_extra_targets_json() -> list[StoryTarget]:
     return _parse_targets_json_env("VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON")
+
+
+def _parse_selection_targets(selection_params: dict[str, Any] | None) -> list[StoryTarget]:
+    payload = (selection_params or {}).get("story_targets_override")
+    if payload in (None, "", []):
+        return []
+    env_key = "selection_params.story_targets_override"
+    if not isinstance(payload, list):
+        raise RuntimeError(f"{env_key} must be a JSON-like list")
+
+    targets: list[StoryTarget] = []
+    for idx, item in enumerate(payload):
+        if isinstance(item, str):
+            peer = _normalize_peer(item)
+            label = peer or f"override-{idx + 1}"
+            delay_seconds = 0
+            mode = "upload"
+        elif isinstance(item, dict):
+            peer = _normalize_peer(str(item.get("peer") or item.get("target") or ""))
+            label = str(item.get("label") or peer or f"override-{idx + 1}")
+            try:
+                delay_seconds = max(0, int(item.get("delay_seconds") or 0))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{env_key}[{idx}].delay_seconds must be int"
+                ) from exc
+            raw_mode = str(item.get("mode") or item.get("publish_mode") or "upload").strip().lower()
+            mode = raw_mode if raw_mode in {"upload", "repost_previous"} else "upload"
+        else:
+            raise RuntimeError(f"{env_key}[{idx}] items must be strings or objects")
+        if not peer:
+            raise RuntimeError(f"{env_key}[{idx}] is missing peer/target")
+        targets.append(
+            StoryTarget(
+                peer=peer,
+                label=label.strip() or peer,
+                delay_seconds=delay_seconds,
+                mode=mode,
+            )
+        )
+    return targets
 
 
 async def _resolve_main_target(
@@ -406,7 +465,9 @@ async def build_story_publish_config(
     if not story_publish_enabled():
         return None
     selection_params = selection_params or {}
-    targets = _parse_story_targets_json()
+    targets = _parse_selection_targets(selection_params)
+    if not targets:
+        targets = _parse_story_targets_json()
     if not targets:
         main_target = await _resolve_main_target(db, main_chat_id)
         if main_target:

@@ -4,10 +4,16 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import subprocess
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional runtime dependency in tests/dev
+    cv2 = None
 from aiogram import types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile
@@ -59,6 +65,67 @@ logger.info(
     VIDEO_MAX_MB,
     VIDEO_KAGGLE_TIMEOUT_MINUTES,
 )
+
+
+def _video_thumbnail_input(video_path: str | Path) -> types.BufferedInputFile | None:
+    encoded_bytes: bytes | None = None
+    if cv2 is not None:
+        cap = cv2.VideoCapture(str(video_path))
+        if cap.isOpened():
+            try:
+                ok, frame = cap.read()
+            finally:
+                cap.release()
+            if ok and frame is not None:
+                ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                if ok:
+                    encoded_bytes = encoded.tobytes()
+        else:
+            logger.warning("video_announce: failed to open video for thumbnail %s", video_path)
+    if not encoded_bytes and shutil.which("ffmpeg"):
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "-",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            encoded_bytes = result.stdout
+    if not encoded_bytes:
+        logger.info("video_announce: explicit video thumbnail unavailable for %s", video_path)
+        return None
+    stem = Path(video_path).stem
+    return types.BufferedInputFile(encoded_bytes, filename=f"{stem}_thumb.jpg")
+
+
+async def _send_video_with_preview(
+    bot,
+    chat_id: int,
+    video_path: str | Path,
+    *,
+    caption: str,
+) -> None:
+    await bot.send_video(
+        chat_id,
+        FSInputFile(video_path),
+        thumbnail=_video_thumbnail_input(video_path),
+        caption=caption,
+        supports_streaming=True,
+    )
 
 
 def _status_keyboard(session_id: int) -> types.InlineKeyboardMarkup:
@@ -901,9 +968,10 @@ async def run_kernel_poller(
                 f"⚠️ Сессия #{session_obj.id}: {story_failure}",
             )
             try:
-                await bot.send_video(
+                await _send_video_with_preview(
+                    bot,
                     notify_chat_id,
-                    FSInputFile(video_path),
+                    video_path,
                     caption=f"{caption}\n\n⚠️ Story publish failed",
                 )
             except Exception:
@@ -927,15 +995,13 @@ async def run_kernel_poller(
                 )
             return
         target_test = test_chat_id or notify_chat_id
-        video_input = FSInputFile(video_path)
         try:
-            await bot.send_video(target_test, video_input, caption=caption)
+            await _send_video_with_preview(bot, target_test, video_path, caption=caption)
         except Exception as e:
             logger.warning("video_announce: failed to send video to test chat %s: %s", target_test, e)
             # Fallback to notify_chat_id if test_chat_id fails
             if target_test != notify_chat_id:
-                video_input = FSInputFile(video_path)
-                await bot.send_video(notify_chat_id, video_input, caption=caption)
+                await _send_video_with_preview(bot, notify_chat_id, video_path, caption=caption)
         await _send_logs(bot, notify_chat_id, log_files, caption=f"✅ Логи сессии #{session_obj.id}")
         session_obj = await _update_status(
             db,
@@ -954,8 +1020,7 @@ async def run_kernel_poller(
             )
         if main_chat_id:
             try:
-                video_input_main = FSInputFile(video_path)
-                await bot.send_video(main_chat_id, video_input_main, caption=caption)
+                await _send_video_with_preview(bot, main_chat_id, video_path, caption=caption)
                 await _mark_published_main(db, session_obj)
                 async with db.get_session() as session:
                     refreshed = await session.get(VideoAnnounceSession, session_obj.id)

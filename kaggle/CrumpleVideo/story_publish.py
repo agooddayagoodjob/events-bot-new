@@ -364,10 +364,14 @@ async def _story_targets_report(
         account=account,
         media_path=media_path,
     )
+    previous_story: dict[str, Any] | None = None
     for idx, target_cfg in enumerate(config.get("targets") or []):
         peer_ref = str(target_cfg.get("peer") or "").strip()
         label = str(target_cfg.get("label") or peer_ref or f"target-{idx + 1}")
         delay_seconds = max(0, int(target_cfg.get("delay_seconds") or 0))
+        publish_mode = str(target_cfg.get("mode") or "upload").strip().lower()
+        if publish_mode not in {"upload", "repost_previous"}:
+            publish_mode = "upload"
         if honor_delays and delay_seconds:
             log(f"⏳ Story target {label}: sleeping {delay_seconds}s before publish")
             import asyncio
@@ -377,6 +381,7 @@ async def _story_targets_report(
             "peer": peer_ref,
             "label": label,
             "delay_seconds": delay_seconds,
+            "mode": publish_mode,
             "period_seconds": int(config.get("period_seconds") or 24 * 60 * 60),
             "pinned": bool(config.get("pinned")),
             "ok": False,
@@ -388,16 +393,39 @@ async def _story_targets_report(
                 can_send.to_dict() if hasattr(can_send, "to_dict") else str(can_send)
             )
             if media_path is not None:
-                media = await _input_media_for_path(client, media_path)
+                send_kwargs: dict[str, Any]
+                if publish_mode == "repost_previous":
+                    if not previous_story:
+                        raise RuntimeError(
+                            "repost_previous target requires a successful prior story target"
+                        )
+                    source_peer = previous_story["peer"]
+                    source_story_id = int(previous_story["story_id"])
+                    media = types.InputMediaStory(peer=source_peer, id=source_story_id)
+                    target_report["source_story_id"] = source_story_id
+                    target_report["source_peer"] = previous_story.get("peer_ref")
+                    target_report["source_label"] = previous_story.get("label")
+                    send_kwargs = {
+                        "peer": peer,
+                        "media": media,
+                        "privacy_rules": [types.InputPrivacyValueAllowAll()],
+                        "pinned": bool(config.get("pinned")),
+                        "period": int(config.get("period_seconds") or 24 * 60 * 60),
+                        "fwd_from_id": source_peer,
+                        "fwd_from_story": source_story_id,
+                    }
+                else:
+                    media = await _input_media_for_path(client, media_path)
+                    send_kwargs = {
+                        "peer": peer,
+                        "media": media,
+                        "privacy_rules": [types.InputPrivacyValueAllowAll()],
+                        "pinned": bool(config.get("pinned")),
+                        "caption": str(config.get("caption") or "").strip() or None,
+                        "period": int(config.get("period_seconds") or 24 * 60 * 60),
+                    }
                 result = await client(
-                    functions.stories.SendStoryRequest(
-                        peer=peer,
-                        media=media,
-                        privacy_rules=[types.InputPrivacyValueAllowAll()],
-                        pinned=bool(config.get("pinned")),
-                        caption=str(config.get("caption") or "").strip() or None,
-                        period=int(config.get("period_seconds") or 24 * 60 * 60),
-                    )
+                    functions.stories.SendStoryRequest(**send_kwargs)
                 )
                 target_report["story_id"] = _extract_story_id(result)
                 target_report["result"] = (
@@ -411,6 +439,13 @@ async def _story_targets_report(
                         else ""
                     )
                 )
+                if target_report.get("story_id") is not None:
+                    previous_story = {
+                        "peer": peer,
+                        "peer_ref": peer_ref,
+                        "label": label,
+                        "story_id": int(target_report["story_id"]),
+                    }
             else:
                 log(f"✅ Story preflight passed for {label}")
             target_report["ok"] = True

@@ -611,24 +611,22 @@ This section captures the latest intro-direction request as an explicit delta to
   - by `12:30 Europe/Kaliningrad` the daily output should already be ready on its target surface for the current rollout phase.
 - Exact env names and start-time knobs may still change during implementation, but the schedule must stay independently switchable from `/v tomorrow`.
 
-## Story readiness, but disabled
+## Story publish enabled for prod
 
-- The implementation should remain compatible with the existing Kaggle-side story publish pipeline.
-- Current implementation state:
-  - CherryFlash now bundles the same Kaggle-side `story_publish.py` helper used by `CrumpleVideo`;
-  - the CherryFlash notebook now runs the same story preflight/publish hook chain when a story config is actually present;
-  - the `popular_review` path still keeps `story_publish_enabled=false` by default, so the common story path is implemented but intentionally inactive until the user explicitly enables it.
-- Phase 1 default:
-  - story autopublish disabled;
-  - while the story gate is off, the validation publication target is `@keniggpt`;
-  - no story failure path may affect the normal mp4 publication while the story gate is off.
-- Required readiness for later enablement:
-  - the future production target is story publication in the first half of the day, and the explicit readiness bar is a live story by `12:30 Europe/Kaliningrad`;
-  - story autopublish should be enabled only after CherryFlash passes preproduction validation on Kaggle;
-  - the existing story-autopublish path already proven on `CrumpleVideo` may be reused / adapted for CherryFlash when this gate opens;
-  - story targets can be configured without redesigning selection logic;
-  - caption / mode metadata for this video type can be supplied when stories are enabled later.
+- CherryFlash reuses the same Kaggle-side `story_publish.py` helper path already proven on `CrumpleVideo`.
+- `popular_review` now requests story publish by default in production mode.
+- CherryFlash keeps its story routing local to the profile selection params instead of changing global story env fanout:
+  - first target: `@kenigevents`, normal upload, no delay;
+  - second target: `@lovekenig`, `delay_seconds=600`, `mode=repost_previous`, so the second publication is a repost of the first story instead of a second media upload.
+- Story preflight/publish remains blocking for the run when enabled: if any target fails, the notebook writes `story_publish_report.json` and the whole CherryFlash release is treated as failed.
+- Production readiness expectation remains:
+  - daily CherryFlash should already be ready in the first half of the day;
+  - the scheduled run should reuse the same story config as manual `/v -> CherryFlash`, not a separate legacy branch.
 
+## Telegram publish surface
+
+- Final CherryFlash video publication to Telegram channels now goes through `send_video(..., supports_streaming=True)` and explicitly attaches a thumbnail extracted from the first frame of the rendered mp4.
+- The expected feed/list preview in Telegram should therefore match the first frame of the produced release instead of relying on Telegram-side thumbnail inference.
 ## Data and observability deltas
 
 - Session metadata should explicitly mark this mode, for example `selection_params.mode=popular_review`.

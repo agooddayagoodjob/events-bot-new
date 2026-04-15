@@ -392,6 +392,7 @@ color: #100E0E;
   - notebook читает `story_publish.json` из session-dataset;
   - auth для Telethon передаётся в Kaggle через encrypted split-datasets (`story_publish.enc` + `story_publish.key`);
   - production order лучше задавать явно через `VIDEO_ANNOUNCE_STORY_TARGETS_JSON`; если он задан, именно этот ordered list целиком определяет target fanout (например `@kenigevents`, затем `@lovekenig` через `600` секунд);
+  - target objects in `VIDEO_ANNOUNCE_STORY_TARGETS_JSON` may also carry `mode=repost_previous`, which means “do not upload media again; repost the previously published story target after its delay”;
   - `main`-канал профиля + `VIDEO_ANNOUNCE_STORY_EXTRA_TARGETS_JSON` остаются только как legacy fallback, если explicit ordered list не задан;
   - exact scheduled rerun через `_run_scheduled_video_tomorrow` должен наследовать тот же story-config, что и обычный cron-slot; если `story_publish.json` отсутствует в таком rerun, это считается prod-config defect, а не отдельным режимом работы;
   - перед долгим video-render notebook делает `CanSendStoryRequest` preflight; если текущая Telegram-сессия не умеет публиковать stories (например, user account без `Telegram Premium`) или target не принимает stories, run останавливается до рендера и пишет понятный `story_publish_report.json`;

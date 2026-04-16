@@ -71,7 +71,7 @@ def test_story_safe_video_scales_and_pads_non_story_canvas(
     def fake_dimensions(path: Path) -> tuple[int, int]:
         if path.name == helper.STORY_SAFE_VIDEO_FILENAME:
             return (helper.STORY_VIDEO_WIDTH, helper.STORY_VIDEO_HEIGHT)
-        return (720, 1280)
+        return (1080, 1920)
 
     def fake_run(cmd, capture_output=None, text=None, check=None):  # noqa: ANN001,ARG001
         commands.append(cmd)
@@ -92,5 +92,5 @@ def test_story_safe_video_scales_and_pads_non_story_canvas(
 
     ffmpeg_cmd = commands[0]
     filter_graph = ffmpeg_cmd[ffmpeg_cmd.index("-vf") + 1]
-    assert "scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos" in filter_graph
-    assert "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black" in filter_graph
+    assert "scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos" in filter_graph
+    assert "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black" in filter_graph

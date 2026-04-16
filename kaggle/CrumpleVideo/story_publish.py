@@ -22,9 +22,9 @@ KEY_FILENAME = "story_publish.key"
 MAX_VIDEO_BYTES = 30 * 1024 * 1024
 PREMIUM_REQUIRED_ERROR_NAME = "PremiumAccountRequiredError"
 CRUMPLE_VIDEO_STORY_PREVIEW_TS = 0
-STORY_VIDEO_WIDTH = 1080
-STORY_VIDEO_HEIGHT = 1920
-STORY_SAFE_VIDEO_FILENAME = "crumple_video_story_1080x1920.mp4"
+STORY_VIDEO_WIDTH = 720
+STORY_VIDEO_HEIGHT = 1280
+STORY_SAFE_VIDEO_FILENAME = "crumple_video_story_720x1280.mp4"
 
 
 def _find_input_file(filename: str, *, search_roots: list[Path]) -> Path | None:

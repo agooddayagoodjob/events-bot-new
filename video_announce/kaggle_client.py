@@ -229,6 +229,21 @@ def _should_force_gpu_for_local_kernel(folder_name: str, meta_data: dict[str, An
     return "crumple-video" in haystack or "crumple video" in haystack
 
 
+def _should_allow_cpu_fallback_for_local_kernel(
+    folder_name: str,
+    meta_data: dict[str, Any],
+) -> bool:
+    if _should_force_gpu_for_local_kernel(folder_name, meta_data):
+        return True
+    if str(folder_name or "").strip().casefold() == "cherryflash":
+        return True
+    kernel_id = str(meta_data.get("id") or "").strip().casefold()
+    slug = str(meta_data.get("slug") or "").strip().casefold()
+    title = str(meta_data.get("title") or "").strip().casefold()
+    haystack = " ".join(part for part in (kernel_id, slug, title) if part)
+    return "cherryflash" in haystack
+
+
 def _load_kernel_ignore_patterns(base_path: Path) -> list[str]:
     patterns = list(DEFAULT_KERNEL_IGNORE_PATTERNS)
     ignore_path = base_path / ".kaggleignore"
@@ -795,7 +810,10 @@ class KaggleClient:
                 meta_data,
                 allow_cpu_fallback=(
                     is_local
-                    and str(meta_data.get("id") or "").strip().casefold().endswith("/cherryflash")
+                    and _should_allow_cpu_fallback_for_local_kernel(
+                        local_kernel_name,
+                        meta_data,
+                    )
                 ),
             )
             result_ref = str(

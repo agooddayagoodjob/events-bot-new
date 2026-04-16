@@ -215,6 +215,73 @@ def test_deploy_kernel_update_retries_without_gpu_on_cherryflash_quota(monkeypat
     assert push_gpu_flags == [True, False]
 
 
+def test_deploy_kernel_update_retries_without_gpu_on_crumplevideo_quota(monkeypatch, tmp_path):
+    _install_dummy_kaggle(monkeypatch)
+    module = importlib.import_module("video_announce.kaggle_client")
+    KaggleClient = module.KaggleClient
+
+    kernel_dir = tmp_path / "CrumpleVideo"
+    kernel_dir.mkdir()
+    (kernel_dir / "kernel-metadata.json").write_text(
+        """
+{
+  "id": "zigomaro/crumple-video",
+  "title": "Crumple Video",
+  "code_file": "crumple_video.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["zigomaro/video-announce-assets"],
+  "slug": "crumple-video"
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    (kernel_dir / "crumple_video.ipynb").write_text(
+        '{"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}',
+        encoding="utf-8",
+    )
+
+    class Response:
+        def __init__(self, *, ref="", version_number=0, error="", invalid_dataset_sources=None):
+            self.ref = ref
+            self.versionNumber = version_number
+            self.error = error
+            self.invalidDatasetSources = list(invalid_dataset_sources or [])
+
+    push_gpu_flags: list[bool] = []
+
+    class StubApi:
+        def kernels_push(self, folder, timeout=None):
+            del timeout
+            meta = module.json.loads((Path(folder) / "kernel-metadata.json").read_text(encoding="utf-8"))
+            push_gpu_flags.append(bool(meta.get("enable_gpu")))
+            if len(push_gpu_flags) == 1:
+                return Response(
+                    error="Maximum weekly GPU quota of 30.00 hours reached.",
+                )
+            return Response(ref="/code/zigomaro/crumple-video", version_number=77)
+
+    client = KaggleClient()
+    monkeypatch.setattr(client, "_get_api", lambda: StubApi())
+    monkeypatch.setattr(
+        module,
+        "find_local_kernel",
+        lambda kernel_ref: {"path": str(kernel_dir), "slug": "crumple-video", "id": kernel_ref},
+    )
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+
+    result = client.deploy_kernel_update(
+        "zigomaro/crumple-video",
+        ["zigomaro/video-announce-session-501"],
+    )
+
+    assert result == "zigomaro/crumple-video"
+    assert push_gpu_flags == [True, False]
+
+
 def test_deploy_kernel_update_retries_invalid_dataset_sources_until_valid(monkeypatch, tmp_path):
     _install_dummy_kaggle(monkeypatch)
     module = importlib.import_module("video_announce.kaggle_client")

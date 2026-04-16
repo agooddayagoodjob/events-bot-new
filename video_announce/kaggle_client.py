@@ -52,6 +52,41 @@ DEFAULT_KERNEL_IGNORE_PATTERNS = (
     "sequence/",
     "sequence*/",
 )
+KERNEL_PUSH_INVALID_DATASET_RETRY_SECONDS = 180
+KERNEL_PUSH_INVALID_DATASET_RETRY_POLL_SECONDS = 10
+
+
+def _normalize_kernel_ref(ref: str | None) -> str:
+    value = str(ref or "").strip()
+    if value.startswith("/code/"):
+        return value[len("/code/") :]
+    return value
+
+
+def _extract_save_kernel_response(response: Any) -> dict[str, Any]:
+    def _attr(*names: str) -> Any:
+        for name in names:
+            if hasattr(response, name):
+                return getattr(response, name)
+        return None
+
+    invalid_dataset_sources = _attr("invalidDatasetSources", "invalid_dataset_sources") or []
+    return {
+        "ref": _normalize_kernel_ref(_attr("ref")),
+        "url": str(_attr("url") or "").strip(),
+        "version_number": _attr("versionNumber", "version_number"),
+        "error": str(_attr("error") or "").strip(),
+        "invalid_dataset_sources": [
+            str(item).strip()
+            for item in invalid_dataset_sources
+            if str(item).strip()
+        ],
+    }
+
+
+def _is_gpu_quota_error(message: str) -> bool:
+    lowered = str(message or "").casefold()
+    return "gpu quota" in lowered or "weekly gpu quota" in lowered
 
 
 async def await_kernel_dataset_sources(
@@ -240,6 +275,75 @@ def _copy_kernel_tree(src_root: Path, dst_root: Path) -> None:
                 shutil.copy2(item, dest)
 
     _copy_dir(src_root, dst_root, Path())
+
+
+def _push_kernel_request_with_retries(
+    api: Any,
+    tmp_path: Path,
+    meta_path: Path,
+    meta_data: dict[str, Any],
+    *,
+    timeout: str | None = None,
+    allow_cpu_fallback: bool = False,
+) -> dict[str, Any]:
+    requested_sources = [
+        str(item).strip()
+        for item in (meta_data.get("dataset_sources") or [])
+        if str(item).strip()
+    ]
+    retry_deadline = (
+        time.monotonic() + KERNEL_PUSH_INVALID_DATASET_RETRY_SECONDS
+        if requested_sources
+        else time.monotonic()
+    )
+
+    while True:
+        meta_path.write_text(json.dumps(meta_data, ensure_ascii=False, indent=2))
+        response = api.kernels_push(str(tmp_path), timeout=timeout)
+        response_info = _extract_save_kernel_response(response)
+        logger.info(
+            "kaggle: kernels_push response ref=%s version=%s error=%s invalid_dataset_sources=%s",
+            response_info.get("ref"),
+            response_info.get("version_number"),
+            response_info.get("error"),
+            response_info.get("invalid_dataset_sources"),
+        )
+
+        error = str(response_info.get("error") or "").strip()
+        if error:
+            if (
+                allow_cpu_fallback
+                and bool(meta_data.get("enable_gpu"))
+                and _is_gpu_quota_error(error)
+            ):
+                logger.warning(
+                    "kaggle: kernels_push hit GPU quota; retrying without GPU for kernel=%s",
+                    meta_data.get("id") or meta_data.get("slug"),
+                )
+                meta_data["enable_gpu"] = False
+                continue
+            raise RuntimeError(f"Kaggle kernels_push failed: {error}")
+
+        invalid_requested = [
+            item
+            for item in response_info.get("invalid_dataset_sources") or []
+            if item in requested_sources
+        ]
+        if invalid_requested:
+            if time.monotonic() < retry_deadline:
+                logger.warning(
+                    "kaggle: kernels_push invalid dataset sources=%s; waiting %ss and retrying",
+                    invalid_requested,
+                    KERNEL_PUSH_INVALID_DATASET_RETRY_POLL_SECONDS,
+                )
+                time.sleep(KERNEL_PUSH_INVALID_DATASET_RETRY_POLL_SECONDS)
+                continue
+            raise RuntimeError(
+                "Kaggle kernels_push rejected dataset sources: "
+                + ", ".join(invalid_requested)
+            )
+
+        return response_info
 
 
 def _prune_kernel_tree(root: Path) -> None:
@@ -527,15 +631,29 @@ class KaggleClient:
                     )
                     meta_data["id"] = new_id
             if dataset_sources is not None:
-                meta_data["dataset_sources"] = dataset_sources
-                meta_path.write_text(json.dumps(meta_data, ensure_ascii=False, indent=2))
+                meta_data["dataset_sources"] = [
+                    str(item).strip()
+                    for item in dataset_sources
+                    if str(item).strip()
+                ]
             files = sorted(
                 (f.relative_to(tmp_path).as_posix(), f.stat().st_size)
                 for f in tmp_path.rglob("*")
                 if f.is_file()
             )
             logger.info("kaggle: pushing kernel files=%s", files)
-            api.kernels_push(str(tmp_path), timeout=timeout)
+            response_info = _push_kernel_request_with_retries(
+                api,
+                tmp_path,
+                meta_path,
+                meta_data,
+                timeout=timeout,
+            )
+            if not response_info.get("ref"):
+                logger.info(
+                    "kaggle: kernels_push completed without explicit ref for kernel=%s",
+                    meta_data.get("id") or meta_data.get("slug"),
+                )
 
     def kernels_list(self, user: str, page_size: int = 20) -> list[dict]:
         api = self._get_api()
@@ -635,9 +753,14 @@ class KaggleClient:
                 if isinstance(dataset_sources, str)
                 else list(dataset_sources)
             )
-            existing_sources = meta_data.get("dataset_sources", [])
+            existing_sources = [
+                str(item).strip()
+                for item in (meta_data.get("dataset_sources") or [])
+                if str(item).strip()
+            ]
             for dataset_slug in requested_sources:
-                if dataset_slug not in existing_sources:
+                dataset_slug = str(dataset_slug).strip()
+                if dataset_slug and dataset_slug not in existing_sources:
                     existing_sources.append(dataset_slug)
             meta_data["dataset_sources"] = existing_sources
             # Ensure internet is enabled for pip installs
@@ -665,9 +788,27 @@ class KaggleClient:
                 if f.is_file()
             )
             logger.info("kaggle: pushing kernel files=%s", files)
-            api.kernels_push(str(tmp_path))
-            result_ref = str(meta_data.get("id") or meta_data.get("slug") or kernel_ref)
-            logger.info("kaggle: kernel deployed successfully ref=%s", result_ref)
+            response_info = _push_kernel_request_with_retries(
+                api,
+                tmp_path,
+                meta_path,
+                meta_data,
+                allow_cpu_fallback=(
+                    is_local
+                    and str(meta_data.get("id") or "").strip().casefold().endswith("/cherryflash")
+                ),
+            )
+            result_ref = str(
+                response_info.get("ref")
+                or meta_data.get("id")
+                or meta_data.get("slug")
+                or kernel_ref
+            ).strip()
+            logger.info(
+                "kaggle: kernel deployed successfully ref=%s version=%s",
+                result_ref,
+                response_info.get("version_number"),
+            )
             
             # Wait for Kaggle to propagate metadata changes before kernel starts
             logger.info("kaggle: waiting 10s for metadata to propagate...")

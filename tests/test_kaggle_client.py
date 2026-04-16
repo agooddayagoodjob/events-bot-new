@@ -1,6 +1,7 @@
 import importlib
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -145,3 +146,137 @@ async def test_await_dataset_ready_waits_until_status_ready_and_payload_visible(
 
     assert meta["status"] == "ready"
     assert "payload.json" in meta["files"]
+
+
+def test_deploy_kernel_update_retries_without_gpu_on_cherryflash_quota(monkeypatch, tmp_path):
+    _install_dummy_kaggle(monkeypatch)
+    module = importlib.import_module("video_announce.kaggle_client")
+    KaggleClient = module.KaggleClient
+
+    kernel_dir = tmp_path / "CherryFlash"
+    kernel_dir.mkdir()
+    (kernel_dir / "kernel-metadata.json").write_text(
+        """
+{
+  "id": "zigomaro/cherryflash",
+  "title": "CherryFlash",
+  "code_file": "cherryflash.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": []
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    (kernel_dir / "cherryflash.ipynb").write_text(
+        '{"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}',
+        encoding="utf-8",
+    )
+
+    class Response:
+        def __init__(self, *, ref="", version_number=0, error="", invalid_dataset_sources=None):
+            self.ref = ref
+            self.versionNumber = version_number
+            self.error = error
+            self.invalidDatasetSources = list(invalid_dataset_sources or [])
+
+    push_gpu_flags: list[bool] = []
+
+    class StubApi:
+        def kernels_push(self, folder, timeout=None):
+            del timeout
+            meta = module.json.loads((Path(folder) / "kernel-metadata.json").read_text(encoding="utf-8"))
+            push_gpu_flags.append(bool(meta.get("enable_gpu")))
+            if len(push_gpu_flags) == 1:
+                return Response(
+                    error="Maximum weekly GPU quota of 30.00 hours reached.",
+                    invalid_dataset_sources=["zigomaro/cherryflash-session-200"],
+                )
+            return Response(ref="/code/zigomaro/cherryflash", version_number=53)
+
+    client = KaggleClient()
+    monkeypatch.setattr(client, "_get_api", lambda: StubApi())
+    monkeypatch.setattr(
+        module,
+        "find_local_kernel",
+        lambda kernel_ref: {"path": str(kernel_dir), "slug": "cherryflash", "id": kernel_ref},
+    )
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+
+    result = client.deploy_kernel_update(
+        "zigomaro/cherryflash",
+        ["zigomaro/cherryflash-session-200"],
+    )
+
+    assert result == "zigomaro/cherryflash"
+    assert push_gpu_flags == [True, False]
+
+
+def test_deploy_kernel_update_retries_invalid_dataset_sources_until_valid(monkeypatch, tmp_path):
+    _install_dummy_kaggle(monkeypatch)
+    module = importlib.import_module("video_announce.kaggle_client")
+    KaggleClient = module.KaggleClient
+
+    kernel_dir = tmp_path / "CherryFlash"
+    kernel_dir.mkdir()
+    (kernel_dir / "kernel-metadata.json").write_text(
+        """
+{
+  "id": "zigomaro/cherryflash",
+  "title": "CherryFlash",
+  "code_file": "cherryflash.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": []
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    (kernel_dir / "cherryflash.ipynb").write_text(
+        '{"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}',
+        encoding="utf-8",
+    )
+
+    class Response:
+        def __init__(self, *, ref="", version_number=0, error="", invalid_dataset_sources=None):
+            self.ref = ref
+            self.versionNumber = version_number
+            self.error = error
+            self.invalidDatasetSources = list(invalid_dataset_sources or [])
+
+    calls = {"count": 0}
+
+    class StubApi:
+        def kernels_push(self, folder, timeout=None):
+            del folder, timeout
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return Response(
+                    ref="/code/zigomaro/cherryflash",
+                    version_number=53,
+                    invalid_dataset_sources=["zigomaro/cherryflash-session-201"],
+                )
+            return Response(ref="/code/zigomaro/cherryflash", version_number=54)
+
+    client = KaggleClient()
+    monkeypatch.setattr(client, "_get_api", lambda: StubApi())
+    monkeypatch.setattr(
+        module,
+        "find_local_kernel",
+        lambda kernel_ref: {"path": str(kernel_dir), "slug": "cherryflash", "id": kernel_ref},
+    )
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+
+    result = client.deploy_kernel_update(
+        "zigomaro/cherryflash",
+        ["zigomaro/cherryflash-session-201"],
+    )
+
+    assert result == "zigomaro/cherryflash"
+    assert calls["count"] == 2

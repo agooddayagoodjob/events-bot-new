@@ -10,7 +10,9 @@
 
 ## Current Production Policy
 
-- включается через `ENABLE_RUNTIME_FILE_LOGGING=1`;
+- production currently keeps this mirror **disabled** (`ENABLE_RUNTIME_FILE_LOGGING=0`) after the April 16, 2026 disk-pressure incident on Fly volume `/data`;
+- the file-logging path remains available as an incident/debug tool, but should not stay permanently enabled on the current volume size without explicit space budgeting;
+- when temporarily enabled, it:
 - пишет существующий root logger приложения в файловый mirror;
 - путь по умолчанию: `RUNTIME_LOG_DIR=/data/runtime_logs`;
 - имя файла по умолчанию: `RUNTIME_LOG_BASENAME=events-bot.log`;

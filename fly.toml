@@ -8,7 +8,7 @@ app = "events-bot-new-wngqia"
 [env]
   PORT = "8080"
   PYTHONOPTIMIZE = "2"
-  ENABLE_RUNTIME_FILE_LOGGING = "1"
+  ENABLE_RUNTIME_FILE_LOGGING = "0"
   RUNTIME_LOG_DIR = "/data/runtime_logs"
   RUNTIME_LOG_BASENAME = "events-bot.log"
   RUNTIME_LOG_RETENTION_HOURS = "24"

@@ -1,12 +1,13 @@
 # CherryFlash / Popular Video Afisha
 
-> **Status:** In active implementation / Not confirmed by user  
-> **Scope:** daily popularity-driven video announce mode for `/v` ("Быстрый обзор") with automatic publication to `@keniggpt` in phase 1.
+> **Status:** Production testing / Not confirmed by user  
+> **Scope:** daily popularity-driven video announce mode for `/v` ("Быстрый обзор") with phase-1 publication to `@keniggpt`, formally deployed on production, but still not user-confirmed because there has not yet been a fully successful end-to-end story publication run.
 >
 > **Naming + product boundary**
 > - marketing / product name: `CherryFlash`
 > - product description: `Popular Video Afisha`
 > - internal mode key: `popular_review`
+> - sibling profile variant: `cherryflash_libsvtav1`
 > - this is a separate daily video product and must not modify, replace, or destabilize the existing `CrumpleVideo` runtime;
 > - canonical docs and Kaggle runtime for this product now live under `CherryFlash`, not under historical `CrumpleVideo` naming.
 
@@ -17,11 +18,20 @@
 - Popularity signal and `/popular_posts`: `docs/features/post-metrics/README.md`
 - Scheduler policy: `docs/operations/cron.md`
 
+## Current rollout state
+
+- CherryFlash is no longer backlog-only: the runtime is already deployed and exercised against production infrastructure.
+- The feature remains `Not confirmed by user`:
+  - production testing is still in progress;
+  - there has not yet been a fully successful live run that completed story publication end-to-end.
+- Canonical docs therefore live under `docs/features/cherryflash/`, while unresolved rollout gaps remain tracked inside this feature doc instead of under backlog.
+
 ## Operator launch contract
 
 - `/v` must expose CherryFlash as a direct one-click operator action, not only as a generic profile hidden behind the manual selection flow.
 - The dedicated CherryFlash button must call `VideoAnnounceScenario.run_popular_review_pipeline()` directly.
 - The legacy `vidstart:popular_review` route must resolve to the same direct pipeline and must not create a generic manual-selection session for `popular_review`.
+- The sibling `CherryFlash libsvtav1` button must call the same direct CherryFlash pipeline with `profile_key=cherryflash_libsvtav1`, not a forked selection/render flow.
 - `/v` may still keep a separate `⚙️ Каналы` path for CherryFlash channel configuration, but launch and configuration must be distinct actions.
 
 ## Product identity
@@ -29,15 +39,18 @@
 - `CherryFlash` is the user-facing / marketing name of the daily popularity-driven video product described in this document.
 - `Popular Video Afisha` is the descriptive product family label for docs and operator communication.
 - `popular_review` remains the canonical internal mode / profile key in code and session metadata.
+- `cherryflash_libsvtav1` is a sibling CherryFlash profile on the same runtime contract:
+  - same popularity selection, scene-generation, publication, and story-helper path;
+  - different encode profile (`libsvtav1`) and launch shape (button-only, no scheduler wiring).
 - planned canonical Kaggle runtime path for this product:
   - `kaggle/CherryFlash/`
 - current notebook delivery path:
-- the launcher mirrors the working Telegram/Telegraph Kaggle pattern: it creates a one-run Kaggle dataset with a unique slug, uploads the full mounted CherryFlash runtime tree (`mobilefeed_intro_still.py`, `scripts/`, `assets/`) in that single `CreateDataset` step, waits until Kaggle reports that dataset ready and the mounted runtime files are visible, then waits for kernel metadata to bind that dataset through `dataset_sources`, and the notebook runs `scripts/render_mobilefeed_intro_scene1_approval.py` from the mounted tree.
+  - the launcher mirrors the working Telegram/Telegraph Kaggle pattern: it creates a one-run Kaggle dataset with a unique slug, uploads a mounted CherryFlash runtime tree (`mobilefeed_intro_still.py`, `scripts/`, `assets/`) directly, waits until Kaggle reports that dataset ready and the mounted runtime files are visible, then waits for kernel metadata to bind that dataset through `dataset_sources`, and the notebook runs `scripts/render_mobilefeed_intro_scene1_approval.py` from the mounted tree.
   - the runtime dataset must be populated from the real `/popular_posts` pool for that run, not from a stale baked poster pack: launcher-side prep writes a fresh `assets/cherryflash_selection.json` plus poster files under `assets/posters/`, so the mounted Kaggle render uses the same current event payload that was selected before upload.
   - the Kaggle notebook must resolve the runtime source from the newest mounted top-level `cherryflash-session-*` bundle and must not pick the first recursive `scripts/render_cherryflash_full.py` match anywhere under `/kaggle/input`, because older still-mounted session datasets may coexist with the new one during manual reruns or debugging.
   - the Kaggle notebook must reuse the same shared story-helper dependency contract as `CrumpleVideo`: if `kaggle_common/story_publish.py` is shipped in the bundle, the notebook environment must already install its runtime dependencies (`opencv-python`, `requests`, `telethon`, `cryptography`) instead of introducing a CherryFlash-only conditional bootstrap path.
   - the Kaggle notebook must also reuse the same thread-safe async bridge pattern as the working `CrumpleVideo` papermill runtime when calling story preflight/publish helpers; nested `asyncio.run()` or direct `new_event_loop().run_until_complete(...)` from inside the notebook cell are not allowed because papermill already executes under a running event loop.
-- CherryFlash keeps the one-run unique dataset naming pattern, and the upload contract is now explicitly single-step: the full runtime bundle must go through one `CreateDataset` call for that unique slug; the old bootstrap `CreateDataset` + `CreateDatasetVersion` sequence is no longer canonical because it can stall on prod before any visible `kernels_push`, leaving CherryFlash with no actual Kaggle run.
+  - CherryFlash keeps the one-run unique dataset naming pattern, but dataset upload is now explicitly two-step: `CreateDataset` first bootstraps the unique slug with a tiny marker file, then `CreateDatasetVersion` uploads the full runtime bundle; this avoids Kaggle `CreateDataset` fragility on the mounted CherryFlash payload while preserving the same per-run dataset isolation contract used in production flows.
   - CherryFlash runtime prefetch must fail fast on unstable poster hosts such as `files.catbox.moe`: remote poster prefetch is a best-effort acceleration step, not a mandatory gate before Kaggle upload, so dead Catbox URLs must not burn multiple 20-second retries before the run can even reach Kaggle.
   - the selection manifest must preserve `poster_candidates`, not only a derived `poster_file` basename: if launcher-side prefetch could not materialize a local poster into `assets/posters/`, the Kaggle intro runtime must still be able to resolve the same event artwork from the original remote candidate list instead of crashing on a synthetic missing local filename.
   - CherryFlash selection itself must be renderability-aware before dataset upload: an event may enter the runtime bundle only if it already has at least one non-`files.catbox.moe` poster URL or if a source-specific rehydrate recovers one (`t.me` public-page poster fallback or production `VK wall.getById` poster fetch); catbox-only events that still have no renderable poster after that rehydrate must be dropped from selection instead of being pushed into Kaggle with a guaranteed missing `assets/posters/*` dependency.
@@ -306,7 +319,6 @@ This section captures the latest intro-direction request as an explicit delta to
   - the latest motion-approval pass now renders a cheaper `360 x 640` preview clip for `intro + scene1 + music`, while keeping the same `9:16` geometry and the same beat-lock target as the future clean pass;
   - both preview and clean `--final` approval clips must now render every intro frame at full cadence; synthetic in-between intro frames from `Image.blend` or similar shortcuts are rejected because they create staircase motion and false smoothness;
   - the current handoff retune keeps scene `1` near local `~1.80s`, so the cut lands just after the start of `move_up`; the upward move must already be visible on the strong accent, but the intro must not swallow the whole upward phase;
-  - the full CherryFlash renderer must preserve that same first-scene handoff contract in production output: scene `1` starts from the approved late-start / visible-`move_up` window instead of replaying the early `scale 0.4 -> 1.0` zoom, while scenes `2+` and follow-up beats still keep the full local `0.0 -> ...` timing contract;
   - the current clean pass also applies a targeted intro timing warp around the previously reported near-static pairs (`second 2: frames 11/12 and 26/27`, `second 3: frames 26/27`) so those beats no longer read as duplicate holds while the handoff frame and `move_up` strong-beat anchor stay unchanged;
   - the 2D upward move now uses a less delayed cubic in/out motion for the validation clip; the previous quintic curve delayed visible movement too much and made the upward shift feel late and then abrupt;
   - the 3D camera progress curve must keep a small non-zero tail velocity into the handoff; a fully eased-to-zero close-in plateau reads as a micro-stop before the 2D upward move and is a defect;
@@ -565,31 +577,42 @@ This section captures the latest intro-direction request as an explicit delta to
   - if duplicate removal changes clip duration **before** the first `move-up` beat anchor, the audio start offset must be shifted by the removed duration so the strong beat still lands on the same `move-up` frame;
   - duplicate removal after that anchor must not force a second retime of the already-approved first `move-up` beat.
 - Dedupe output should be visible in artifacts/logs so remaining visual holds can be audited from the run output.
-- The proven fix for the reproduced “frozen / near-frozen” 2D pairs is now in the encode stage, not in the scene math:
+- The proven fix for the previously observed “frozen / near-frozen” 2D pairs is now in the encode stage, not in the scene math:
   - the source PNG frame sequence may already be visually smooth while the final mp4 is defective;
-  - the root cause for the reproduced two-scene probe was `MoviePy.ImageSequenceClip.write_videofile()`, which introduced presentation-timestamp jitter during encode and caused certain decoded frames to map back to the previous source PNG;
+  - the root cause for the reproduced two-scene probe was `MoviePy.ImageSequenceClip.write_videofile()`, which introduced presentation-timestamp jitter during encode and caused the decoder/encoder chain to duplicate certain frames (`decoded[n]` mapping back to `source[n-1]`);
   - CherryFlash must therefore encode the final mp4 through a direct `ffmpeg` image-sequence path (`image2` demuxer with explicit `-framerate <FPS>`), so each `frame_%04d.png` receives an exact `1/FPS` timestamp and no synthetic duplicate-frame pattern is introduced by the wrapper layer;
   - when validating similar incidents, always inspect both the source PNG sequence and the decoded mp4 frame mapping before changing scene math, easing, or drift-speed hypotheses;
   - viewer-facing `date_line` / `location_line` in the full CherryFlash renderer must still use the same human formatter as the approved first-scene path, so ISO dates or raw comma-heavy address strings never leak into the final 2D scenes;
   - a CherryFlash render that still contains obvious exact-neighbour duplicates after the direct `ffmpeg` image-sequence encode is defective and should be investigated as a render-math issue, not silently masked by a second global dedupe pass.
-- The final publish-grade mp4 must now be story-native on that same direct `ffmpeg` path:
-  - target canvas: `720x1280` (`9:16` Telegram story-native resolution, not FHD with a later downscale);
-  - target budget: the complete daily release with intro, `2..6` event scenes, and branded outro should fit within about `15 MB`;
-  - final mode should therefore render directly to `720x1280` and encode as `H.264` / `libx264` with `AAC 128k`, while local preview mode may keep a smaller half-scale canvas for iteration;
-  - this story-native publish profile is a delivery contract, not a post-render transcode band-aid.
-- Kaggle notebook bootstrap must tolerate transient third-party apt mirror incidents:
-  - CherryFlash setup must not fail the whole run because a non-essential external repo such as `cloud.r-project.org` is mid-sync during `apt-get update`;
-  - before installing the required runtime packages (`ffmpeg`, `libxrender1`, `libxi6`, `libxkbcommon-x11-0`), the notebook may disable that flaky CRAN source and retry `apt-get update` with explicit apt retry options;
-  - such bootstrap hardening is part of the renderability contract, because a run that never reaches the renderer due to a temporary mirror mismatch is still a failed CherryFlash release.
 
 ## Delivery contract
+
+### Story-native final artifact
+
+- CherryFlash final mode must render directly to a story-native `720x1280` canvas instead of building a `1080x1920` master and relying on downstream downscale/transcode.
+- The single publish-grade mp4 must stay on the same direct `ffmpeg image2` encode path described above and use:
+  - `libx264`
+  - `crf=26`
+  - `preset=fast`
+  - `profile:v high`
+  - `level:v 4.1`
+  - `pix_fmt yuv420p`
+  - `movflags +faststart`
+  - `AAC 128k`
+- The target budget for the complete daily release with intro, `2..6` event scenes, and branded outro remains about `<=15 MB`.
+- This story-native contract is not a publish-side transcode workaround:
+  - intro, 2D scenes, and outro should be laid out against the same `720x1280` canvas directly;
+  - if geometry regresses after the switch, the first place to inspect is render math / scale conversion, not a secondary export helper.
+- The shared Kaggle story helper should target the same `720x1280` `H.264/AAC` canvas for story upload normalization, rather than converting from a separate FHD master.
 
 ### Profile / mode identity
 
 - Recommended rollout shape:
   - introduce the dedicated internal mode/profile key `popular_review`;
+  - add the sibling internal mode/profile key `cherryflash_libsvtav1` for the AV1-encoded variant;
   - keep the user-facing label compatible with the existing `/v -> Быстрый обзор` mental model if needed.
 - The new mode must be visibly distinguishable in logs/traces/scheduler notifications from `/v tomorrow`.
+- `cherryflash_libsvtav1` must stay visibly distinguishable from `popular_review` in session metadata, logs, and manifest files even though both reuse the same CherryFlash runtime bundle.
 
 ### Publication target
 
@@ -611,50 +634,35 @@ This section captures the latest intro-direction request as an explicit delta to
   - it does not consume Gemma and should not be blocked by Gemma-related heavy-job scheduling by default;
   - by `12:30 Europe/Kaliningrad` the daily output should already be ready on its target surface for the current rollout phase.
 - Exact env names and start-time knobs may still change during implementation, but the schedule must stay independently switchable from `/v tomorrow`.
+- Scope note for sibling profiles:
+  - the scheduler contract above applies to `popular_review`;
+  - `cherryflash_libsvtav1` must not register its own cron/autostart slot and is launched only from `/v` UI buttons.
 
-## Story publish enabled for prod
+## Story readiness, but disabled
 
-- CherryFlash reuses the same Kaggle-side `story_publish.py` helper path already proven on `CrumpleVideo`.
-- `popular_review` now requests story publish by default in production mode.
-- CherryFlash keeps its story routing local to the profile selection params instead of changing global story env fanout:
-  - first target: `@kenigevents`, normal upload, no delay;
-  - second target: `@lovekenig`, `delay_seconds=600`, `mode=repost_previous`, so the second publication is a repost of the first story instead of a second media upload.
-- Story preflight/publish remains blocking for the run when enabled: if any target fails, the notebook writes `story_publish_report.json` and the whole CherryFlash release is treated as failed.
-- Production readiness expectation remains:
-  - daily CherryFlash should already be ready in the first half of the day;
-  - the scheduled run should reuse the same story config as manual `/v -> CherryFlash`, not a separate legacy branch.
+- The implementation should remain compatible with the existing Kaggle-side story publish pipeline.
+- Current implementation state:
+  - CherryFlash now bundles the same Kaggle-side `story_publish.py` helper used by `CrumpleVideo`;
+  - the CherryFlash notebook now runs the same story preflight/publish hook chain when a story config is actually present;
+  - the `popular_review` path still keeps `story_publish_enabled=false` by default, so the common story path is implemented but intentionally inactive until the user explicitly enables it.
+- Sibling profile rule:
+  - `cherryflash_libsvtav1` reuses the same common story path but requests `story_publish_enabled=true` by default in its session params;
+  - actual story publication still depends on the shared global story infra (`build_story_publish_config()` and secret datasets) being available for that run.
+- Phase 1 default:
+  - story autopublish disabled;
+  - while the story gate is off, the validation publication target is `@keniggpt`;
+  - no story failure path may affect the normal mp4 publication while the story gate is off.
+- Required readiness for later enablement:
+  - the future production target is story publication in the first half of the day, and the explicit readiness bar is a live story by `12:30 Europe/Kaliningrad`;
+  - story autopublish should be enabled only after CherryFlash passes preproduction validation on Kaggle;
+  - the existing story-autopublish path already proven on `CrumpleVideo` may be reused / adapted for CherryFlash when this gate opens;
+  - story targets can be configured without redesigning selection logic;
+  - caption / mode metadata for this video type can be supplied when stories are enabled later.
 
-## Telegram publish surface
-
-- CherryFlash must publish a single final mp4 artifact, not a separate Telegram-only transcode.
-- The final artifact is now story-first and is encoded directly through `ffmpeg image2` muxing as:
-  - `720x1280`
-  - `libx264`
-  - `crf=26`
-  - `preset=fast`
-  - `profile:v high`
-  - `level:v 4.1`
-  - `pix_fmt yuv420p`
-  - `movflags +faststart`
-  - `AAC 128k`
-- Telegram publication goes through that same final file via `send_video(..., supports_streaming=True)`.
-- If visual geometry regresses after the switch to `720x1280`, the first place to inspect is the render math / scale contract, not a secondary publish-sidecar.
-
-## Story publish contract
-
-- CherryFlash manual `/v -> CherryFlash` and scheduled `popular_review` runs share the same story runtime contract.
-- The dataset builder must merge `session.selection_params` over the payload-level viewer metadata before deciding whether story publish is requested.
-- The payload JSON may intentionally carry a reduced `selection_params` object for render/runtime needs; that reduced payload metadata must not disable story publish or drop target overrides during Kaggle bundle assembly.
-- The shared Kaggle story helper must normalize any story video upload to a Telegram-safe `H.264/AAC` canvas before `SendStoryRequest`, targeting the same `720x1280` story-native contract as the final CherryFlash artifact.
-- This internal story-safe transcode is a shared helper responsibility for story delivery only; it must not create a second channel-publish artifact or replace the single story-native `720x1280 H.264/AAC` release file used for normal Telegram channel posts.
-- If the selection manifest requests story publish, the Kaggle notebook must fail closed when:
-  - the shared `story_publish.py` helper is absent from the mounted bundle;
-  - `story_publish.json` is not mounted into Kaggle input;
-  - preflight/publish returns a failing report.
-- A run where `story_publish_enabled=true` but `story_publish.json` is missing must never silently continue to mp4-only delivery.
 ## Data and observability deltas
 
 - Session metadata should explicitly mark this mode, for example `selection_params.mode=popular_review`.
+- Session metadata for the sibling AV1 profile must explicitly mark `selection_params.mode=cherryflash_libsvtav1`.
 - Candidate traces should persist enough data to explain why an event was selected:
   - popularity score;
   - marks;
@@ -666,6 +674,7 @@ This section captures the latest intro-direction request as an explicit delta to
 ## Acceptance checklist
 
 - [ ] There is a dedicated scheduled mode for the popularity-driven quick review.
+- [ ] There is a separate button-only CherryFlash profile `cherryflash_libsvtav1` with no scheduler/autostart wiring.
 - [ ] One successful run publishes no more than `6` and no fewer than `2` events.
 - [ ] A run with only `0` or `1` eligible event does not publish a video.
 - [ ] Every selected event belongs to the same candidate universe that `/popular_posts` would surface at build time.
@@ -686,12 +695,13 @@ This section captures the latest intro-direction request as an explicit delta to
 - [ ] The phone-screen CTA stack reads in depth above/below the poster without text-on-text collisions.
 - [ ] Critical CTA/date/city content stays inside story-safe bounds and avoids common Telegram / Instagram story UI overlay zones.
 - [ ] Phase 1 publication goes only to `@keniggpt`.
-- [ ] Story autopublish is enabled for the production CherryFlash route and uses the same contract for manual and scheduled runs.
-- [ ] By `12:30 Europe/Kaliningrad`, the scheduled CherryFlash story is already published to its target surfaces.
+- [ ] Story autopublish stays off, while the mode remains story-ready for later rollout.
+- [ ] `cherryflash_libsvtav1` requests story publish by default while still using the same shared CherryFlash story helper path.
+- [ ] When story autopublish is later enabled, the target operating expectation is that the story is already published by `12:30 Europe/Kaliningrad`.
 
 ## Linked design work
 
-- Intro/cover concept work for this mode lives in `docs/backlog/features/cherryflash/design-brief.md`.
+- Intro/cover concept work for this mode lives in `docs/features/cherryflash/design-brief.md`.
 - The current approval render tooling lives in:
   - `kaggle/CherryFlash/mobilefeed_intro_still.py`
   - `kaggle/CherryFlash/assets/`

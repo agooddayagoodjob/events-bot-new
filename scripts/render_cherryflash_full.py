@@ -73,14 +73,9 @@ FINAL_CARD_DURATION = 3.5
 FINAL_CARD_FADE_IN = 0.3
 AUDIO_BITRATE = "128k"
 FIRST_PRIMARY_SCENE_START_LOCAL = approval.SCENE1_START_LOCAL
-FINAL_VIDEO_CODEC = "libx265"
-FINAL_VIDEO_TAG = "hvc1"
-FINAL_VIDEO_PRESET = "slow"
-FINAL_VIDEO_CRF = "28"
-FINAL_X265_PARAMS = (
-    f"keyint={FPS}:min-keyint={FPS}:scenecut=0:no-open-gop=1:"
-    "repeat-headers=1:aq-mode=3:vbv-maxrate=3000:vbv-bufsize=6000"
-)
+FINAL_VIDEO_CODEC = "libx264"
+FINAL_VIDEO_PRESET = "fast"
+FINAL_VIDEO_CRF = "26"
 PREVIEW_VIDEO_CODEC = "libx264"
 PREVIEW_VIDEO_PRESET = "slow"
 PREVIEW_VIDEO_CRF = "23"
@@ -279,7 +274,7 @@ def _build_outro_strip(
     bbox = font.getbbox(text)
     text_w = int(math.ceil(font.getlength(text)))
     text_h = bbox[3] - bbox[1]
-    pad_x = max(18, round(25 * (W / 1080.0)))
+    pad_x = max(18, round(25 * (W / approval.BASE_W)))
     strip_w = text_w + pad_x * 2
     text_y = int((strip_height - text_h) / 2 - bbox[1])
     image = Image.new("RGBA", (strip_w, strip_height), (*OUTRO_STRIP, 255))
@@ -422,7 +417,7 @@ def _followup_geometry(local_t: float, poster_size: tuple[int, int]) -> tuple[in
 
 def _build_primary_blocks(scene: RenderScene):
     blocks: list = []
-    scale = W / 1080.0
+    scale = W / approval.BASE_W
     title_blocks, next_y = approval._build_text_blocks(
         scene.title,
         font_path=PRIMARY_TITLE_FONT,
@@ -461,11 +456,11 @@ def _build_followup_blocks(scene: RenderScene):
     return approval._build_text_blocks(
         description,
         font_path=DESCRIPTION_FONT,
-        font_size=max(24, round(38 * (W / 1080.0))),
+        font_size=max(24, round(38 * (W / approval.BASE_W))),
         text_color=TITLE_COLOR,
         start_time=SCENE_TEXT_START + 0.12,
         duration=approval.T_INFO + 1.0,
-        start_y=SPLIT_Y + round(46 * (W / 1080.0)),
+        start_y=SPLIT_Y + round(46 * (W / approval.BASE_W)),
     )[0]
 
 
@@ -508,7 +503,7 @@ def _render_scene_frame(scene: RenderScene, local_t: float, text_blocks) -> Imag
 
 
 def _render_brand_outro_frame(local_t: float) -> Image.Image:
-    scale = W / 1080.0
+    scale = W / approval.BASE_W
     strip_height = max(56, round(210 * scale))
     gap = max(8, round(20 * scale))
     font_size = max(48, round(160 * scale))
@@ -679,12 +674,16 @@ def _encode_profile() -> dict[str, str | list[str]]:
             "crf": FINAL_VIDEO_CRF,
             "audio_bitrate": AUDIO_BITRATE,
             "extra_args": [
-                "-tag:v",
-                FINAL_VIDEO_TAG,
                 "-g",
                 str(FPS),
-                "-x265-params",
-                FINAL_X265_PARAMS,
+                "-keyint_min",
+                str(FPS),
+                "-sc_threshold",
+                "0",
+                "-profile:v",
+                "high",
+                "-level:v",
+                "4.1",
             ],
         }
     return {

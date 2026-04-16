@@ -80,8 +80,14 @@ PREVIEW_FRAMES_DIR = OUT_DIR / "preview_frames"
 INTRO_SPARSE_DIR = OUT_DIR / "intro_frames_sparse"
 INTRO_INTERP_DIR = OUT_DIR / "intro_frames_interp"
 
-W = 1080 if FINAL_MODE else 360
-H = 1920 if FINAL_MODE else 640
+BASE_W = 1080
+BASE_H = 1920
+FINAL_W = 720
+FINAL_H = 1280
+PREVIEW_W = 360
+PREVIEW_H = 640
+W = FINAL_W if FINAL_MODE else PREVIEW_W
+H = FINAL_H if FINAL_MODE else PREVIEW_H
 FPS = 30
 # Motion approval must use real per-frame 3D renders; otherwise synthetic
 # in-between frames hide the true camera rhythm and reintroduce fake stutter.
@@ -368,7 +374,6 @@ def render_intro_frames() -> None:
             "samples": 48 if FINAL_MODE else 1,
             "allow_cycles_gpu": True,
             "use_denoising": not DISABLE_DENOISE,
-            "denoiser": "OPENIMAGEDENOISE",
             "use_adaptive_sampling": True,
             "adaptive_threshold": 0.014 if FINAL_MODE else 0.12,
             "sample_clamp_direct": 5.0 if FINAL_MODE else 3.0,
@@ -460,6 +465,8 @@ def render_intro_frames() -> None:
             },
         }
     )
+    if not DISABLE_DENOISE:
+        cfg["denoiser"] = "OPENIMAGEDENOISE"
     def _run_blender_with_config(config: dict, path: Path) -> None:
         path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
         subprocess.run(
@@ -684,7 +691,7 @@ def _build_text_blocks(
 
 
 def build_scene_text_blocks(payload: ScenePayload) -> list[WordBlock]:
-    scale = W / 1080.0
+    scale = W / BASE_W
     blocks: list[WordBlock] = []
     title_blocks, next_y = _build_text_blocks(
         payload.title,

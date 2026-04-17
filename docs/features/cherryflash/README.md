@@ -613,6 +613,10 @@ This section captures the latest intro-direction request as an explicit delta to
   - intro, 2D scenes, and outro should be laid out against the same `720x1280` canvas directly;
   - if geometry regresses after the switch, the first place to inspect is render math / scale conversion, not a secondary export helper.
 - The shared Kaggle story helper should target the same `720x1280` `H.264/AAC` canvas for story upload normalization, rather than converting from a separate FHD master.
+- The shared `video_afisha_2d.create_advanced_scene()` helper must stay compatible with both MoviePy 1.x and 2.x clip-scaling APIs:
+  - use `clip.resized(...)` when the build exposes the MoviePy 2.x rename;
+  - fall back to `clip.resize(...)` on older builds;
+  - this compatibility guard is mandatory because CherryFlash and sibling video-announce paths still reuse the same helper under mixed runtime environments.
 
 ### Profile / mode identity
 

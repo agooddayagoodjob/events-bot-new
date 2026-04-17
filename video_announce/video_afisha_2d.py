@@ -318,7 +318,10 @@ def create_advanced_scene(
         return 1.0, int(sy + (-img.h - sy) * ease_in_cubic(prog) - img.h / 2)
 
     moving_img = clip_resize_width(img, config.width)
-    moving_img = moving_img.resize(lambda t: transform_func(t)[0])
+    if hasattr(moving_img, "resized"):
+        moving_img = moving_img.resized(lambda t: transform_func(t)[0])
+    else:
+        moving_img = moving_img.resize(lambda t: transform_func(t)[0])
     moving_img = clip_set_position(moving_img, lambda t: ("center", transform_func(t)[1]))
     moving_img = clip_set_duration(moving_img, total_duration)
 

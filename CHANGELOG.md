@@ -105,6 +105,9 @@
 - **CrumpleVideo / Story Preflight**: Kaggle story publish now checks story capability before the expensive video render and preserves target-specific Telegram API errors in `story_publish_report.json` and poller notifications, so non-premium or otherwise ineligible sessions fail fast instead of burning render time first.
 - **CrumpleVideo / Story Report Serialization**: successful Kaggle story publishes no longer crash while writing `story_publish_report.json` when Telethon includes `datetime` values in the API result payload.
 - **CrumpleVideo / Story Video Cover**: video stories now explicitly request `video_timestamp=0`, so the first frame of the rendered CrumpleVideo is used as the preview/cover frame.
+
+### Fixed
+- **Video Afisha 2D / MoviePy 2.x Resize Compat**: `video_announce.video_afisha_2d.create_advanced_scene()` now uses `clip.resized(...)` when MoviePy 2.x exposes the renamed API and falls back to `clip.resize(...)` on older builds, and the selection regression suite now imports `SelectionContext` from `video_announce.custom_types` instead of the removed `video_announce.types` alias.
 - **CrumpleVideo / Story Target Ordering**: story fanout can now be pinned with explicit `VIDEO_ANNOUNCE_STORY_TARGETS_JSON`, so production order no longer depends on the profile `main` channel and can be fixed to `@kenigevents` first, then `@lovekenig` with a `600s` delay.
 - **Guide Excursions / Template Detail Surface**: added `/guide_template <id>` and template detail inline actions so operators can inspect accumulated `GuideTemplate` route facts, hook rollups, locals/tourists/mixed votes, and linked occurrences instead of only seeing flat template titles.
 - **Guide Excursions / Lollipop Trails Digest Writer**: added a guide-specific `Lollipop Trails` batch writer for digest cards, where Gemma writes only grounded `title + digest_blurb` from materialized fact packs while card shell fields stay deterministic from stored facts.

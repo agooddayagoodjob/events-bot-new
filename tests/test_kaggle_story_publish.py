@@ -39,6 +39,7 @@ def test_story_safe_video_transcodes_even_if_canvas_is_already_story_size(
 
     monkeypatch.setattr(helper, "_ffmpeg_available", lambda: True)
     monkeypatch.setattr(helper, "_video_dimensions", fake_dimensions)
+    monkeypatch.setattr(helper, "_video_probe", lambda path: {"path": str(path), "size_bytes": 1024})
     monkeypatch.setattr(helper.subprocess, "run", fake_run)
 
     story_path = helper._ensure_story_safe_video(
@@ -54,9 +55,14 @@ def test_story_safe_video_transcodes_even_if_canvas_is_already_story_size(
     assert ffmpeg_cmd[:4] == ["ffmpeg", "-y", "-i", str(src)]
     assert ffmpeg_cmd[ffmpeg_cmd.index("-vf") + 1] == "setsar=1"
     assert ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "libx264"
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-preset") + 1] == helper.STORY_VIDEO_PRESET
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-b:v") + 1] == helper.STORY_VIDEO_BITRATE
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-maxrate") + 1] == helper.STORY_VIDEO_MAXRATE
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-bufsize") + 1] == helper.STORY_VIDEO_BUFSIZE
     assert ffmpeg_cmd[ffmpeg_cmd.index("-tag:v") + 1] == "avc1"
     assert ffmpeg_cmd[ffmpeg_cmd.index("-c:a") + 1] == "aac"
     assert ffmpeg_cmd[ffmpeg_cmd.index("-b:a") + 1] == "128k"
+    assert "-shortest" in ffmpeg_cmd
 
 
 def test_story_safe_video_scales_and_pads_non_story_canvas(
@@ -82,6 +88,7 @@ def test_story_safe_video_scales_and_pads_non_story_canvas(
 
     monkeypatch.setattr(helper, "_ffmpeg_available", lambda: True)
     monkeypatch.setattr(helper, "_video_dimensions", fake_dimensions)
+    monkeypatch.setattr(helper, "_video_probe", lambda path: {"path": str(path), "size_bytes": 1024})
     monkeypatch.setattr(helper.subprocess, "run", fake_run)
 
     helper._ensure_story_safe_video(
@@ -94,3 +101,19 @@ def test_story_safe_video_scales_and_pads_non_story_canvas(
     filter_graph = ffmpeg_cmd[ffmpeg_cmd.index("-vf") + 1]
     assert "scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos" in filter_graph
     assert "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black" in filter_graph
+
+
+def test_story_report_includes_media_probe(monkeypatch, tmp_path: Path) -> None:
+    src = tmp_path / "story.mp4"
+    src.write_bytes(b"video")
+    monkeypatch.setattr(helper, "_video_probe", lambda path: {"path": str(path), "width": 720})
+
+    report = helper._build_story_report(
+        {"mode": "video", "pinned": True},
+        phase="publish",
+        account={"id": 1, "username": "story"},
+        media_path=src,
+    )
+
+    assert report["media_path"] == str(src)
+    assert report["media"] == {"path": str(src), "width": 720}

@@ -646,6 +646,11 @@ This section captures the latest intro-direction request as an explicit delta to
 - The dataset builder must merge `session.selection_params` over the payload-level viewer metadata before deciding whether story publish is requested.
 - The payload JSON may intentionally carry a reduced `selection_params` object for render/runtime needs; that reduced payload metadata must not disable story publish or drop target overrides during Kaggle bundle assembly.
 - The shared Kaggle story helper must normalize any story video upload to a Telegram-safe `H.264/AAC` canvas before `SendStoryRequest`, targeting the same `720x1280` story-native contract as the final CherryFlash artifact.
+- The story-helper encode profile must stay stricter than a generic archival mp4:
+  - `b:v=900k`, `preset=fast`, `maxrate=1200k`, `bufsize=2400k`;
+  - `pix_fmt=yuv420p`, `tag:v=avc1`, `movflags=+faststart`, `AAC 128k`, stereo `44100 Hz`;
+  - no B-frames (`bf=0`) and a one-second GOP (`g=30`, `keyint_min=30`) to avoid Telegram story upload edge cases.
+- `story_publish_report.json` must include media diagnostics (`size_bytes`, geometry, fps/frame count, duration, approximate bitrate) for the exact story-safe file passed to `SendStoryRequest`, so `MEDIA_FILE_INVALID` incidents can be investigated from the Kaggle output without downloading the full render payload.
 - This internal story-safe transcode is a shared helper responsibility for story delivery only; it must not create a second channel-publish artifact or replace the single story-native `720x1280 H.264/AAC` release file used for normal Telegram channel posts.
 - If the selection manifest requests story publish, the Kaggle notebook must fail closed when:
   - the shared `story_publish.py` helper is absent from the mounted bundle;

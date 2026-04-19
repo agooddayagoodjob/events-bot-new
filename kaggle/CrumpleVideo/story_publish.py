@@ -25,6 +25,10 @@ CRUMPLE_VIDEO_STORY_PREVIEW_TS = 0
 STORY_VIDEO_WIDTH = 720
 STORY_VIDEO_HEIGHT = 1280
 STORY_SAFE_VIDEO_FILENAME = "crumple_video_story_720x1280.mp4"
+STORY_VIDEO_PRESET = "fast"
+STORY_VIDEO_BITRATE = "900k"
+STORY_VIDEO_MAXRATE = "1200k"
+STORY_VIDEO_BUFSIZE = "2400k"
 
 
 def _find_input_file(filename: str, *, search_roots: list[Path]) -> Path | None:
@@ -110,6 +114,40 @@ def _video_dimensions(path: Path) -> tuple[int, int] | None:
         cap.release()
 
 
+def _video_probe(path: Path) -> dict[str, Any]:
+    info: dict[str, Any] = {"path": str(path)}
+    try:
+        info["size_bytes"] = int(path.stat().st_size)
+    except Exception:
+        pass
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        info["readable"] = False
+        return info
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        duration = frame_count / fps if fps > 0 and frame_count > 0 else 0.0
+        info.update(
+            {
+                "readable": True,
+                "width": width,
+                "height": height,
+                "fps": round(fps, 3),
+                "frame_count": int(frame_count) if frame_count > 0 else 0,
+                "duration_seconds": round(duration, 3),
+            }
+        )
+        size_bytes = info.get("size_bytes")
+        if duration > 0 and isinstance(size_bytes, int):
+            info["approx_bitrate_kbps"] = round(size_bytes * 8 / duration / 1000, 1)
+    finally:
+        cap.release()
+    return info
+
+
 def _ensure_story_safe_video(
     path: Path,
     *,
@@ -152,9 +190,13 @@ def _ensure_story_safe_video(
             "-level:v",
             "4.1",
             "-preset",
-            "veryfast",
-            "-crf",
-            "20",
+            STORY_VIDEO_PRESET,
+            "-b:v",
+            STORY_VIDEO_BITRATE,
+            "-maxrate",
+            STORY_VIDEO_MAXRATE,
+            "-bufsize",
+            STORY_VIDEO_BUFSIZE,
             "-pix_fmt",
             "yuv420p",
             "-g",
@@ -173,6 +215,11 @@ def _ensure_story_safe_video(
             "aac",
             "-b:a",
             "128k",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-shortest",
             str(story_path),
         ],
         capture_output=True,
@@ -201,9 +248,18 @@ def _ensure_story_safe_video(
         if isinstance(dimensions, tuple) and len(dimensions) == 2
         else "unknown"
     )
+    story_info = _video_probe(story_path)
+    story_size = int(story_info.get("size_bytes") or story_path.stat().st_size)
+    story_kb = story_size / 1024
+    story_bitrate = story_info.get("approx_bitrate_kbps")
+    bitrate_label = (
+        f", ~{story_bitrate} kbps" if isinstance(story_bitrate, (int, float)) else ""
+    )
     log(
         "✅ Story-safe video prepared: "
-        f"{story_path.name} ({original_label} -> {STORY_VIDEO_WIDTH}x{STORY_VIDEO_HEIGHT}, h264/aac)"
+        f"{story_path.name} ({original_label} -> {STORY_VIDEO_WIDTH}x{STORY_VIDEO_HEIGHT}, "
+        f"h264/aac, bitrate={STORY_VIDEO_BITRATE}, maxrate={STORY_VIDEO_MAXRATE}, "
+        f"{story_kb:.1f} KiB{bitrate_label})"
     )
     return story_path
 
@@ -358,6 +414,7 @@ def _build_story_report(
     }
     if media_path is not None:
         report["media_path"] = str(media_path)
+        report["media"] = _video_probe(media_path)
     return report
 
 

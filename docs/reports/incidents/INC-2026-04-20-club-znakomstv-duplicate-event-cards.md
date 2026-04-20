@@ -1,6 +1,6 @@
 # INC-2026-04-20 Club Znakomstv Duplicate Event Cards
 
-Status: open
+Status: monitoring
 Severity: sev2
 Service: Smart Event Update / production event cards
 Opened: 2026-04-20
@@ -83,8 +83,9 @@ Related docs: `docs/features/smart-event-update/README.md`, `docs/features/linke
 
 ## Immediate Mitigation
 
-- Investigate all active prod rows in the cluster and identify canonical survivor (`event_id=3957`).
-- Remove duplicate prod rows after reattaching useful source/fact evidence to the canonical event and rebuild affected pages.
+- Investigated all active prod rows in the cluster and identified canonical survivor `event_id=3957`.
+- Reattached `event_source`, `event_source_fact`, and `eventposter` evidence from `4042`, `4043`, `4051` onto `3957`.
+- Removed duplicate prod rows and re-rendered the survivor event page (`https://telegra.ph/SHOU-KLUB-ZNAKOMSTV-04-16`).
 
 ## Corrective Actions
 
@@ -99,10 +100,16 @@ Related docs: `docs/features/smart-event-update/README.md`, `docs/features/linke
 
 ## Release And Closure Evidence
 
-- deployed SHA: `—`
-- deploy path: `—`
-- regression checks: `—`
-- post-deploy verification: `—`
+- deployed SHA: `0d53dd1a7cf9764297f7c3d1b87b02f7bd9cde70`
+- deploy path: `flyctl deploy --remote-only` from clean worktree `hotfix/inc-2026-04-20-club-znakomstv`, commit reachable from `origin/main`
+- regression checks:
+  - `pytest -q tests/test_smart_event_update_duplicate_guards.py` -> `2 passed`
+  - production SQL after cleanup: `select ... from event where date='2026-04-22' and location_name like '%Форма пицца-бар%'` -> only `event_id=3957`
+  - survivor Telegraph event page rebuilt in prod
+- post-deploy verification:
+  - Fly release `v970` completed successfully
+  - canonical prod row now keeps all four source anchors on `event_id=3957`
+  - follow-up note: direct full rebuild of April multipage surface exposed a pre-existing `CONTENT_TOO_BIG` failure on `sync_month_page`; duplicate cluster itself is removed, but the month rebuild path should be audited separately if that surface must be refreshed immediately.
 
 ## Prevention
 

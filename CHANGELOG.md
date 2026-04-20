@@ -112,6 +112,7 @@
 - **CrumpleVideo / Story Video Cover**: video stories now explicitly request `video_timestamp=0`, so the first frame of the rendered CrumpleVideo is used as the preview/cover frame.
 
 ### Fixed
+- **Smart Event Update / Copy-Post Duplicate Guard**: Smart Update now converges same-day reposts with near-identical source text even when ticket URLs differ, and it bridges `doors/start` variants like `сбор гостей 19:00, начало 20:00` so one show no longer spawns parallel `19:00` and `20:00` cards across Telegram/VK copy posts.
 - **Video Afisha 2D / MoviePy 2.x Resize Compat**: `video_announce.video_afisha_2d.create_advanced_scene()` now uses `clip.resized(...)` when MoviePy 2.x exposes the renamed API and falls back to `clip.resize(...)` on older builds, and the selection regression suite now imports `SelectionContext` from `video_announce.custom_types` instead of the removed `video_announce.types` alias.
 - **CrumpleVideo / Story Target Ordering**: story fanout can now be pinned with explicit `VIDEO_ANNOUNCE_STORY_TARGETS_JSON`, so production order no longer depends on the profile `main` channel and can be fixed to `@kenigevents` first, then `@lovekenig` with a `600s` delay.
 - **Guide Excursions / Template Detail Surface**: added `/guide_template <id>` and template detail inline actions so operators can inspect accumulated `GuideTemplate` route facts, hook rollups, locals/tourists/mixed votes, and linked occurrences instead of only seeing flat template titles.

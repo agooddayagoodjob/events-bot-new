@@ -18,6 +18,9 @@
 
 ## Активные regression contracts
 
+- `INC-2026-04-20-club-znakomstv-duplicate-event-cards.md`
+  - Scope: `smart_event_update.py`, `vk_intake.py`, cross-source repost merge guards, event-page rebuild path, prod event rows for the same day/venue cluster.
+  - Must not regress: one real event must not survive as multiple active cards when reposts vary only by ticket URL/button wording or when one extractor takes `doors` time and another takes `start` time from the same source text.
 - `INC-2026-04-19-cherryflash-story-media-invalid.md`
   - Scope: `kaggle/CrumpleVideo/story_publish.py`, `kaggle/CrumpleVideo/crumple_video.ipynb`, CherryFlash story bundle, Telegram `SendStoryRequest` media profile.
   - Must not regress: CherryFlash story publish must not pass preflight but then fail with opaque `MEDIA_FILE_INVALID`; the exact uploaded story file must be Telegram-safe `720x1280 H.264/AAC` with fixed story bitrate/cap and media diagnostics in `story_publish_report.json`.

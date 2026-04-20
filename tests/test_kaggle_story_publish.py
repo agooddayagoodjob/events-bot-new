@@ -6,6 +6,8 @@ import sys
 from types import SimpleNamespace
 import types
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_PATH = ROOT / "kaggle" / "CrumpleVideo" / "story_publish.py"
@@ -117,3 +119,59 @@ def test_story_report_includes_media_probe(monkeypatch, tmp_path: Path) -> None:
 
     assert report["media_path"] == str(src)
     assert report["media"] == {"path": str(src), "width": 720}
+
+
+def test_validate_native_story_video_accepts_hevc_render(monkeypatch, tmp_path: Path) -> None:
+    src = tmp_path / "final.mp4"
+    src.write_bytes(b"video")
+    monkeypatch.setattr(
+        helper,
+        "_video_probe",
+        lambda path: {
+            "path": str(path),
+            "size_bytes": 9 * 1024 * 1024,
+            "width": 720,
+            "height": 1280,
+            "fps": 30.0,
+            "duration_seconds": 53.0,
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+            "video_codec": "hevc",
+            "video_tag": "hvc1",
+            "pix_fmt": "yuv420p",
+            "audio_codec": "aac",
+            "audio_sample_rate": 48000,
+            "audio_channels": 2,
+            "approx_bitrate_kbps": 1428.0,
+        },
+    )
+
+    validated = helper._validate_native_story_video(src, log=lambda *_args, **_kwargs: None)
+
+    assert validated == src
+
+
+def test_validate_native_story_video_rejects_non_native_profile(monkeypatch, tmp_path: Path) -> None:
+    src = tmp_path / "final.mp4"
+    src.write_bytes(b"video")
+    monkeypatch.setattr(
+        helper,
+        "_video_probe",
+        lambda path: {
+            "path": str(path),
+            "size_bytes": 4 * 1024 * 1024,
+            "width": 720,
+            "height": 1280,
+            "fps": 30.0,
+            "duration_seconds": 53.0,
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+            "video_codec": "h264",
+            "video_tag": "avc1",
+            "pix_fmt": "yuv420p",
+            "audio_codec": "aac",
+            "audio_sample_rate": 44100,
+            "audio_channels": 2,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="native Telegram-ready final mp4"):
+        helper._validate_native_story_video(src, log=lambda *_args, **_kwargs: None)

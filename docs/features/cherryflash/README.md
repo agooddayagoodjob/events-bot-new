@@ -600,19 +600,24 @@ This section captures the latest intro-direction request as an explicit delta to
 
 - CherryFlash final mode must render directly to a story-native `720x1280` canvas instead of building a `1080x1920` master and relying on downstream downscale/transcode.
 - The single publish-grade mp4 must stay on the same direct `ffmpeg image2` encode path described above and use:
-  - `libx264`
-  - `crf=26`
-  - `preset=fast`
-  - `profile:v high`
-  - `level:v 4.1`
+  - `libx265`
+  - `preset=medium`
+  - `b:v=1300k`
+  - `maxrate=1600k`
+  - `bufsize=3200k`
   - `pix_fmt yuv420p`
+  - `tag:v hvc1`
+  - `x265-params keyint=30:min-keyint=30:scenecut=0:open-gop=0:repeat-headers=1`
   - `movflags +faststart`
-  - `AAC 128k`
-- The target budget for the complete daily release with intro, `2..6` event scenes, and branded outro remains about `<=15 MB`.
+  - `AAC-LC 128k stereo 48 kHz`
+- The target budget for the complete daily release with intro, `2..6` event scenes, and branded outro is about `~10 MB` for the current max `~53s` / `6`-event run shape, with a hard delivery ceiling of `<=15 MB`.
 - This story-native contract is not a publish-side transcode workaround:
   - intro, 2D scenes, and outro should be laid out against the same `720x1280` canvas directly;
   - if geometry regresses after the switch, the first place to inspect is render math / scale conversion, not a secondary export helper.
-- The shared Kaggle story helper should target the same `720x1280` `H.264/AAC` canvas for story upload normalization, rather than converting from a separate FHD master.
+- The CherryFlash story upload must be one-pass:
+  - the final render itself is the exact upload artifact for Telegram Stories;
+  - the shared Kaggle story helper must validate and log the final CherryFlash mp4 instead of transcoding it again by default;
+  - a second lossy helper transcode on CherryFlash is defective even if it improves publish reliability, because the product contract prioritizes production-grade audio/video quality and official-native upload format over degraded fallback delivery.
 - The shared `video_afisha_2d.create_advanced_scene()` helper must stay compatible with both MoviePy 1.x and 2.x clip-scaling APIs:
   - use `clip.resized(...)` when the build exposes the MoviePy 2.x rename;
   - fall back to `clip.resize(...)` on older builds;

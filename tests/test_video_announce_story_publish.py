@@ -29,6 +29,7 @@ def test_popular_review_selection_params_enable_story_publish_with_repost_target
 
     assert params["story_publish_enabled"] is True
     assert params["story_publish_mode"] == "video"
+    assert params["story_upload_profile"] == "telegram_story_native_hevc_720p_v1"
     assert params["story_targets_override"] == [
         {"peer": "@kenigevents", "delay_seconds": 0, "mode": "upload"},
         {"peer": "@lovekenig", "delay_seconds": 600, "mode": "repost_previous"},
@@ -57,6 +58,7 @@ async def test_build_story_publish_config_prefers_selection_override_targets(mon
     )
 
     assert config is not None
+    assert config["upload_profile"] is None
     assert config["targets"] == [
         {
             "peer": "@kenigevents",
@@ -77,3 +79,25 @@ async def test_build_story_publish_config_prefers_selection_override_targets(mon
             "mode": "repost_previous",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_build_story_publish_config_keeps_native_upload_profile(monkeypatch):
+    monkeypatch.setenv("VIDEO_ANNOUNCE_STORY_ENABLED", "1")
+
+    config = await story_publish.build_story_publish_config(
+        None,
+        main_chat_id=None,
+        selection_params={
+            "story_publish_enabled": True,
+            "story_publish_mode": "video",
+            "story_upload_profile": "telegram_story_native_hevc_720p_v1",
+            "story_targets_override": [
+                {"peer": "@kenigevents", "delay_seconds": 0, "mode": "upload"},
+            ],
+        },
+        selected_event_dates=["2026-04-16"],
+    )
+
+    assert config is not None
+    assert config["upload_profile"] == "telegram_story_native_hevc_720p_v1"

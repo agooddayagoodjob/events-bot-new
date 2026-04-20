@@ -82,6 +82,9 @@ CherryFlash scheduled run `#170` rendered the final mp4 and passed story preflig
 ## Corrective Actions
 
 - keep the shared helper’s story encode profile aligned with CherryFlash’s story-first delivery profile;
+- CherryFlash now owns a stricter one-pass upload contract than the generic helper:
+  - the final render must already be a Telegram-native `720x1280` `H.265/AAC` story artifact;
+  - the helper must validate and report the uploaded CherryFlash file instead of applying a second lossy default transcode;
 - keep `crumple_video.ipynb` embedded helper synchronized via `kaggle/CrumpleVideo/build_notebook.py`;
 - make future `MEDIA_FILE_INVALID` reports self-contained enough to debug without downloading gigabytes of Kaggle output.
 
@@ -100,5 +103,6 @@ CherryFlash scheduled run `#170` rendered the final mp4 and passed story preflig
 ## Prevention
 
 - story helper tests must assert the upload transcode profile, not only dimensions;
+- CherryFlash tests must assert the final render profile itself (`libx265`, `hvc1`, `30fps`, `AAC 48kHz`) so quality regressions are caught before helper-level publish smoke;
 - release checks for story surfaces must include both preflight and publish evidence;
 - branch reconciliation must not leave embedded notebook helpers stale relative to repo helper files.

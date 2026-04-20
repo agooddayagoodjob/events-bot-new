@@ -1364,6 +1364,7 @@ class VideoAnnounceScenario:
             "allow_empty_ocr": False,
             "story_publish_enabled": True,
             "story_publish_mode": "video",
+            "story_upload_profile": "telegram_story_native_hevc_720p_v1",
             "story_targets_override": [
                 {
                     "peer": "@kenigevents",

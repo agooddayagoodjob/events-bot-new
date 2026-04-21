@@ -77,7 +77,11 @@ async def _run_scheduled_guide_excursions(
     *,
     mode: str,
 ) -> None:
-    from guide_excursions.service import publish_guide_digest, run_guide_monitor
+    from guide_excursions.service import (
+        guide_monitor_has_auto_publish_blockers,
+        publish_guide_digest,
+        run_guide_monitor,
+    )
 
     target_chat_id = await resolve_superadmin_chat_id(db)
     result = await run_guide_monitor(
@@ -90,7 +94,7 @@ async def _run_scheduled_guide_excursions(
         send_progress=bool(target_chat_id),
     )
     auto_publish = _env_enabled("ENABLE_GUIDE_DIGEST_SCHEDULED", default=False)
-    if not auto_publish or mode != "full" or result.errors or bot is None:
+    if not auto_publish or mode != "full" or guide_monitor_has_auto_publish_blockers(result) or bot is None:
         return
     try:
         publish_result = await publish_guide_digest(

@@ -296,6 +296,7 @@ Guide digest не должен произвольно смешивать `про
 - `GUIDE_EXCURSIONS_FULL_TIME_LOCAL=20:10`
 - `GUIDE_EXCURSIONS_TZ=Europe/Kaliningrad`
 - `ENABLE_GUIDE_DIGEST_SCHEDULED=1` включает автопубликацию `new_occurrences` сразу после успешного scheduled `full` scan/import; отдельный cron для digest здесь намеренно не используется, чтобы не гадать длительность Kaggle run и не занимать ещё одно heavy-job окно.
+- если scheduled/recovery `full` run импортировал результат и единственная ошибка — synthetic marker `kaggle result marked as partial`, автопубликация `new_occurrences` всё равно должна идти: soft-partial warning остаётся operator-facing, но не должен срывать весь ежедневный digest;
 - если после scheduled `full` scan у `new_occurrences` нет candidates, scheduled publish должен завершаться bot-only служебным сообщением оператору (`новых экскурсионных находок нет`) без публикации пустого поста в каналы;
 - scheduled `full` slot считается critical daily slot: если первичный APScheduler fire пропущен или записался как `ops_run(... status='skipped', skip_reason='heavy_busy')`, startup catch-up и live watchdog обязаны догонять тот же scheduled `full` path в пределах lookback окна, а catch-up-dispatch ждёт освобождения heavy gate вместо тихого пропуска дня;
 - same-day `light` runs не считаются подтверждением доставки daily `full` slot: recovery должен искать materialized `guide_monitoring` именно с `details.mode='full'`, иначе вечерняя автопубликация может быть ложно признана “уже выполненной”.

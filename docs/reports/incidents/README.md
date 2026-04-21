@@ -18,6 +18,9 @@
 
 ## Активные regression contracts
 
+- `INC-2026-04-20-guide-digest-blocked-by-soft-partial.md`
+  - Scope: `guide_excursions/service.py`, `scheduling.py`, guide monitor recovery/import status handling, `guide_digest_issue`, prod `guide_monitoring_results`.
+  - Must not regress: a scheduled/recovery guide run that imported data successfully must not skip digest auto-publish just because the only recorded error is the synthetic soft-partial marker `kaggle result marked as partial`.
 - `INC-2026-04-20-video-tomorrow-stuck-rendering.md`
   - Scope: scheduled `/v tomorrow`, `video_announce/scenario.py`, `video_announce/poller.py`, `scheduling.py`, runtime supervision, prod sqlite state.
   - Must not regress: scheduled `video_tomorrow` must not crash while leaving the live session orphaned in `RENDERING`, and restart recovery must never poll Kaggle against repo-local `local:*` refs.

@@ -152,6 +152,15 @@ class GuideMonitorResult:
     import_completed: bool = False
 
 
+def _is_guide_monitor_soft_auto_publish_error(error: str) -> bool:
+    normalized = collapse_ws(error).lower()
+    return normalized.startswith("kaggle result marked as partial")
+
+
+def guide_monitor_has_auto_publish_blockers(result: GuideMonitorResult) -> bool:
+    return any(not _is_guide_monitor_soft_auto_publish_error(err) for err in result.errors)
+
+
 class CopyMessages(TelegramMethod[List[types.MessageId]]):
     __returning__ = List[types.MessageId]
     __api_method__ = "copyMessages"
@@ -3211,7 +3220,7 @@ async def resume_guide_monitor_jobs(
                 },
             )
             keep_recovery_job = False
-            if auto_publish_after_import and not import_result.errors:
+            if auto_publish_after_import and not guide_monitor_has_auto_publish_blockers(import_result):
                 if bot is None:
                     keep_recovery_job = True
                 else:

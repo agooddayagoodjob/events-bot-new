@@ -772,10 +772,13 @@ def _compact_source_payload(source_payload: dict[str, Any]) -> dict[str, Any]:
 def _compact_screen_payload(screen: dict[str, Any]) -> dict[str, Any]:
     return {
         "decision": collapse_ws(screen.get("decision")),
+        "extract_family": collapse_ws(screen.get("extract_family")),
+        "multi_announce_likely": bool(screen.get("multi_announce_likely")),
         "post_kind": collapse_ws(screen.get("post_kind")),
         "extract_mode": collapse_ws(screen.get("extract_mode")),
         "digest_eligible_default": collapse_ws(screen.get("digest_eligible_default")),
         "base_region_fit": collapse_ws(screen.get("base_region_fit")),
+        "reasons": _normalize_reasons(screen.get("reasons")),
         "contains_future_public_signal": bool(screen.get("contains_future_public_signal")),
         "contains_past_report_signal": bool(screen.get("contains_past_report_signal")),
     }
@@ -1021,6 +1024,33 @@ def _normalize_reasons(value: Any, *, limit: int = 3) -> list[str]:
     return out
 
 
+def _derive_screen_post_kind(*, decision: str, extract_family: str, multi_announce_likely: bool) -> str:
+    if decision == "announce":
+        return "announce_multi" if multi_announce_likely else "announce_single"
+    if decision == "status_update":
+        return "status_update"
+    if decision == "template_only":
+        return "template_signal" if extract_family == "template" else "on_demand_offer"
+    return "mixed_or_non_target"
+
+
+def _derive_digest_eligible_default(*, decision: str, extract_family: str) -> str:
+    if decision == "announce":
+        return "yes"
+    if decision == "status_update":
+        return "mixed"
+    if decision == "template_only" and extract_family == "template":
+        return "no"
+    return "mixed" if extract_family != "none" else "no"
+
+
+def _derive_contains_past_report_signal(*, decision: str, reasons: Sequence[str]) -> bool:
+    if decision == "ignore":
+        joined = " | ".join(collapse_ws(item).lower() for item in reasons if collapse_ws(item))
+        return "report" in joined or "прош" in joined
+    return False
+
+
 def _normalize_digest_eligibility(
     *,
     date_iso: str | None,
@@ -1050,6 +1080,15 @@ def _coerce_occurrence_items(data: Any) -> list[dict[str, Any]]:
     if isinstance(occurrence, dict):
         return [occurrence]
     return []
+
+
+def _coerce_block_route_items(data: Any) -> tuple[bool, list[dict[str, Any]]]:
+    if not isinstance(data, dict):
+        return False, []
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        return False, []
+    return _boolish(data.get("confirmed_multi_announce")), [item for item in blocks if isinstance(item, dict)]
 
 
 def _has_material_value(value: Any) -> bool:
@@ -1156,34 +1195,15 @@ async def screen_post(source_payload: dict[str, Any], post: ScannedPost, flags: 
         "type": "object",
         "properties": {
             "decision": {"type": "string", "enum": ["ignore", "announce", "status_update", "template_only"]},
-            "post_kind": {
-                "type": "string",
-                "enum": [
-                    "announce_single",
-                    "announce_multi",
-                    "status_update",
-                    "reportage",
-                    "template_signal",
-                    "on_demand_offer",
-                    "mixed_or_non_target",
-                ],
-            },
-            "extract_mode": {"type": "string", "enum": ["none", "announce", "status", "template"]},
-            "digest_eligible_default": {"type": "string", "enum": ["yes", "no", "mixed"]},
-            "contains_future_public_signal": {"type": "boolean"},
-            "contains_past_report_signal": {"type": "boolean"},
-            "base_region_fit": {"type": "string", "enum": ["inside", "outside", "ambiguous", "unknown"]},
+            "extract_family": {"type": "string", "enum": ["none", "announce", "status", "template"]},
+            "multi_announce_likely": {"type": "boolean"},
             "reasons": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
         },
         "required": [
             "decision",
-            "post_kind",
-            "extract_mode",
-            "digest_eligible_default",
-            "contains_future_public_signal",
-            "contains_past_report_signal",
-            "base_region_fit",
+            "extract_family",
+            "multi_announce_likely",
             "reasons",
             "confidence",
         ],
@@ -1192,21 +1212,14 @@ async def screen_post(source_payload: dict[str, Any], post: ScannedPost, flags: 
         "Classify one Telegram post from a guide/excursions source. Return only JSON.\n"
         "Allowed values:\n"
         "- decision: ignore | announce | status_update | template_only\n"
-        "- post_kind: announce_single | announce_multi | status_update | reportage | template_signal | on_demand_offer | mixed_or_non_target\n"
-        "- extract_mode: none | announce | status | template\n"
-        "- digest_eligible_default: yes | no | mixed\n"
-        "- base_region_fit: inside | outside | ambiguous | unknown\n"
+        "- extract_family: none | announce | status | template\n"
         "- confidence: low | medium | high\n"
         "Rules:\n"
         "- announce/status_update only if the post contains a real excursion signal grounded in the input\n"
-        "- if there is a concrete future walk/excursion with date/time/meeting point, prefer announce or status_update over reportage\n"
-        "- if the body is mostly historical/reportage but ends with or inserts a concrete future excursion CTA — including relative date markers (this Sunday, tomorrow, next weekend) or a named guide — treat it as announce or status_update, not reportage; absence of exact time or meeting point is fine\n"
-        "- generic calendars, inspiration, bloom/lifestyle, or travel-wishlist posts without a concrete excursion -> ignore\n"
-        "- if one post clearly contains several different excursions led by the source's own guide, use announce_multi\n"
-        "- a post that enumerates multiple festivals/events across different cities or regions as a round-up/travel calendar is template_only or ignore, even when one entry falls inside source.base_region; individual enumerated entries are not per-guide excursions and must not be materialized as announce\n"
-        "- base_region_fit is your own semantic judgement about whether the concrete excursion(s) in the post take place inside source.base_region; it must not be derived from keyword matching alone\n"
-        "- if the post is about places outside source.base_region (other regions/countries/cities) or is a multi-region travel calendar, set base_region_fit=outside or ambiguous and prefer decision=ignore or template_only\n"
-        "- if source.base_region is empty or the post has no concrete place, use base_region_fit=unknown\n"
+        "- extract_family should say which extractor family to run next: announce | status | template | none\n"
+        "- multi_announce_likely=true only if the post likely contains several different excursion cards or schedule blocks\n"
+        "- generic inspiration, bloom/lifestyle, or non-excursion travel wishlists -> ignore + extract_family=none\n"
+        "- a multi-region travel calendar is ignore or template_only, not announce\n"
         "- do not invent facts\n"
         "- reasons must be 1-3 short grounded strings\n"
         "- no reasoning, analysis, or hidden thinking traces\n"
@@ -1216,13 +1229,15 @@ async def screen_post(source_payload: dict[str, Any], post: ScannedPost, flags: 
         SCREEN_MODEL,
         prompt,
         consumer="guide_scout_screen",
-        max_output_tokens=160,
+        max_output_tokens=96,
         response_schema=schema,
     )
     if not isinstance(data, dict):
         return {
             "decision": "ignore",
             "post_kind": "mixed_or_non_target",
+            "extract_family": "none",
+            "multi_announce_likely": False,
             "extract_mode": "none",
             "digest_eligible_default": "mixed",
             "contains_future_public_signal": False,
@@ -1236,34 +1251,22 @@ async def screen_post(source_payload: dict[str, Any], post: ScannedPost, flags: 
         allowed={"ignore", "announce", "status_update", "template_only"},
         default="ignore",
     )
-    post_kind = _normalize_choice(
-        data.get("post_kind"),
-        allowed={
-            "announce_single",
-            "announce_multi",
-            "status_update",
-            "reportage",
-            "template_signal",
-            "on_demand_offer",
-            "mixed_or_non_target",
-        },
-        default="mixed_or_non_target",
-    )
-    extract_mode = _normalize_choice(
-        data.get("extract_mode"),
+    extract_family = _normalize_choice(
+        data.get("extract_family"),
         allowed={"none", "announce", "status", "template"},
         default="none",
     )
-    digest_eligible_default = _normalize_choice(
-        data.get("digest_eligible_default"),
-        allowed={"yes", "no", "mixed"},
-        aliases={"true": "yes", "false": "no"},
-        default="mixed",
+    multi_announce_likely = _boolish(data.get("multi_announce_likely"))
+    reasons = _normalize_reasons(data.get("reasons"))
+    post_kind = _derive_screen_post_kind(
+        decision=decision,
+        extract_family=extract_family,
+        multi_announce_likely=multi_announce_likely,
     )
-    base_region_fit = _normalize_choice(
-        data.get("base_region_fit"),
-        allowed={"inside", "outside", "ambiguous", "unknown"},
-        default="unknown",
+    extract_mode = extract_family
+    digest_eligible_default = _derive_digest_eligible_default(
+        decision=decision,
+        extract_family=extract_family,
     )
     confidence = _normalize_choice(
         data.get("confidence"),
@@ -1273,14 +1276,77 @@ async def screen_post(source_payload: dict[str, Any], post: ScannedPost, flags: 
     return {
         "decision": decision,
         "post_kind": post_kind,
+        "extract_family": extract_family,
+        "multi_announce_likely": multi_announce_likely,
         "extract_mode": extract_mode,
         "digest_eligible_default": digest_eligible_default,
-        "contains_future_public_signal": _boolish(data.get("contains_future_public_signal")),
-        "contains_past_report_signal": _boolish(data.get("contains_past_report_signal")),
-        "base_region_fit": base_region_fit,
-        "reasons": _normalize_reasons(data.get("reasons")),
+        "contains_future_public_signal": decision in {"announce", "status_update"},
+        "contains_past_report_signal": _derive_contains_past_report_signal(decision=decision, reasons=reasons),
+        "base_region_fit": "unknown",
+        "reasons": reasons,
         "confidence": confidence,
     }
+
+
+async def route_occurrence_blocks(
+    source_payload: dict[str, Any],
+    *,
+    post: ScannedPost,
+    flags: dict[str, Any],
+    screen: dict[str, Any],
+    occurrence_blocks: Sequence[dict[str, Any]],
+) -> tuple[bool, list[dict[str, Any]]]:
+    compact_source = _compact_source_payload(source_payload)
+    compact_screen = _compact_screen_payload(screen)
+    compact_post = {
+        "message_id": post.message_id,
+        "post_date_utc": post.post_date.isoformat(),
+        "message_url": post.source_url,
+        "prefilter_flags": {
+            key: bool(flags.get(key))
+            for key in ("has_date_signal", "has_time_signal", "has_price_signal", "has_booking_signal")
+        },
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "confirmed_multi_announce": {"type": "boolean"},
+            "blocks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source_block_id": {"type": "string"},
+                        "should_extract": {"type": "boolean"},
+                        "temporal_status": {"type": "string", "enum": ["past", "future", "mixed", "unknown"]},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+        "required": ["confirmed_multi_announce", "blocks"],
+    }
+    prompt = (
+        "You are trail_scout.block_router.v1.\n"
+        "Route candidate occurrence blocks from one Telegram guide/excursions post.\n"
+        "Return only JSON.\n"
+        "Rules:\n"
+        "- confirmed_multi_announce=true only if the post really looks like a schedule card or several separate excursion blocks\n"
+        "- for each block, set should_extract=true only for real excursion candidate blocks\n"
+        "- temporal_status is relative to reference_date_utc: past | future | mixed | unknown\n"
+        "- keep clearly past excursion blocks if they are real cards; server-side import may skip them later\n"
+        "- drop pure booking preambles, separators, greetings, or non-excursion noise\n"
+        "- no hidden reasoning traces\n"
+        f"Input:\n{json.dumps({'source': compact_source, 'screen': compact_screen, 'post': compact_post, 'reference_date_utc': datetime.now(timezone.utc).date().isoformat(), 'occurrence_blocks': list(occurrence_blocks)}, ensure_ascii=False)}"
+    )
+    data = await ask_gemma(
+        EXTRACT_MODEL,
+        prompt,
+        consumer="guide_scout_block_router",
+        max_output_tokens=180,
+        response_schema=schema,
+    )
+    return _coerce_block_route_items(data)
 
 
 async def _extract_announce_post_tier1(
@@ -1535,6 +1601,12 @@ def _clean_occurrence_payload(
     return out
 
 
+def _should_run_occurrence_semantics(occurrence_seed: Mapping[str, Any], focus_excerpt: str) -> bool:
+    if collapse_ws(occurrence_seed.get("route_summary")):
+        return False
+    return len(collapse_ws(focus_excerpt)) >= 220
+
+
 async def _extract_occurrence_block(
     source_payload: dict[str, Any],
     *,
@@ -1572,7 +1644,6 @@ async def _extract_occurrence_block(
         "guide_names",
         "organizer_names",
         "base_region_fit",
-        "fact_pack",
     )
     prompt = (
         "You are trail_scout.announce_extract_tier1.v1.\n"
@@ -1601,14 +1672,17 @@ async def _extract_occurrence_block(
         return None
     if not collapse_ws(item.get("source_block_id")):
         item["source_block_id"] = block.get("id")
-    semantic_patch = await _extract_occurrence_semantics(
-        source_payload,
-        post=post,
-        flags=flags,
-        screen=screen,
-        occurrence_seed=item,
-        focus_excerpt=_semantic_focus_excerpt(post, source_block_id=block.get("id")),
-    )
+    focus_excerpt = _semantic_focus_excerpt(post, source_block_id=block.get("id"))
+    semantic_patch: dict[str, Any] = {}
+    if _should_run_occurrence_semantics(item, focus_excerpt):
+        semantic_patch = await _extract_occurrence_semantics(
+            source_payload,
+            post=post,
+            flags=flags,
+            screen=screen,
+            occurrence_seed=item,
+            focus_excerpt=focus_excerpt,
+        )
     return _clean_occurrence_payload(
         _merge_occurrence_layers(item, semantic_patch),
         post=post,
@@ -1703,14 +1777,36 @@ async def _extract_occurrence_semantics(
 
 async def extract_post(source_payload: dict[str, Any], post: ScannedPost, flags: dict[str, Any], screen: dict[str, Any]) -> list[dict[str, Any]]:
     occurrence_blocks = build_occurrence_blocks(post.text, limit=6)
-    is_multi = str(screen.get("post_kind") or "") == "announce_multi"
+    is_multi = bool(screen.get("multi_announce_likely")) and bool(occurrence_blocks)
     extract_mode = str(screen.get("extract_mode") or "none")
+    routed_blocks = [block for block in occurrence_blocks if bool(block.get("has_schedule_anchor"))]
+    confirmed_multi = False
     if is_multi and occurrence_blocks:
+        confirmed_multi, route_items = await route_occurrence_blocks(
+            source_payload,
+            post=post,
+            flags=flags,
+            screen=screen,
+            occurrence_blocks=_compact_occurrence_blocks(post.text, limit=6),
+        )
+        if confirmed_multi:
+            allowed_block_ids = {
+                collapse_ws(item.get("source_block_id"))
+                for item in route_items
+                if _boolish(item.get("should_extract")) and collapse_ws(item.get("source_block_id"))
+            }
+            if allowed_block_ids:
+                routed_blocks = [
+                    block
+                    for block in occurrence_blocks
+                    if collapse_ws(block.get("id")) in allowed_block_ids and bool(block.get("has_schedule_anchor"))
+                ]
+            else:
+                routed_blocks = []
+    if confirmed_multi and routed_blocks:
         cleaned: list[dict[str, Any]] = []
         seen_fingerprints: set[str] = set()
-        for block in occurrence_blocks:
-            if not bool(block.get("has_schedule_anchor")):
-                continue
+        for block in routed_blocks:
             rescued = await _extract_occurrence_block(
                 source_payload,
                 post=post,
@@ -1742,14 +1838,17 @@ async def extract_post(source_payload: dict[str, Any], post: ScannedPost, flags:
                 continue
             merged_item = item
             if extract_mode == "announce":
-                semantic_patch = await _extract_occurrence_semantics(
-                    source_payload,
-                    post=post,
-                    flags=flags,
-                    screen=screen,
-                    occurrence_seed=item,
-                    focus_excerpt=_semantic_focus_excerpt(post, source_block_id=item.get("source_block_id")),
-                )
+                focus_excerpt = _semantic_focus_excerpt(post, source_block_id=item.get("source_block_id"))
+                semantic_patch = {}
+                if _should_run_occurrence_semantics(item, focus_excerpt):
+                    semantic_patch = await _extract_occurrence_semantics(
+                        source_payload,
+                        post=post,
+                        flags=flags,
+                        screen=screen,
+                        occurrence_seed=item,
+                        focus_excerpt=focus_excerpt,
+                    )
                 merged_item = _merge_occurrence_layers(item, semantic_patch)
             occurrence = _clean_occurrence_payload(merged_item, post=post, source_payload=source_payload, screen=screen)
             if occurrence:
@@ -1759,15 +1858,15 @@ async def extract_post(source_payload: dict[str, Any], post: ScannedPost, flags:
                 if fingerprint:
                     seen_fingerprints.add(fingerprint)
                 cleaned.append(occurrence)
-    if is_multi and occurrence_blocks:
+    if confirmed_multi and routed_blocks:
         covered_block_ids = {
             collapse_ws(item.get("source_block_id"))
             for item in cleaned
             if collapse_ws(item.get("source_block_id"))
         }
-        for block in occurrence_blocks:
+        for block in routed_blocks:
             block_id = collapse_ws(block.get("id"))
-            if not block_id or block_id in covered_block_ids or not bool(block.get("has_schedule_anchor")):
+            if not block_id or block_id in covered_block_ids:
                 continue
             rescued = await _extract_occurrence_block(
                 source_payload,
@@ -1884,6 +1983,8 @@ async def process_source(client: TelegramClient, source_payload: dict[str, Any],
             "screen": {
                 "decision": "ignore",
                 "post_kind": "mixed_or_non_target",
+                "extract_family": "none",
+                "multi_announce_likely": False,
                 "extract_mode": "none",
                 "digest_eligible_default": "mixed",
                 "contains_future_public_signal": False,
@@ -1933,6 +2034,8 @@ async def process_source(client: TelegramClient, source_payload: dict[str, Any],
                 payload["screen"] = {
                     "decision": "ignore",
                     "post_kind": "mixed_or_non_target",
+                    "extract_family": "none",
+                    "multi_announce_likely": False,
                     "extract_mode": "none",
                     "digest_eligible_default": "mixed",
                     "contains_future_public_signal": False,

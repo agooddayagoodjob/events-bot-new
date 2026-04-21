@@ -97,6 +97,8 @@ On April 20, 2026 the scheduled evening guide-monitoring full slot (`20:10 Europ
 - Add a shared soft-partial classifier for guide monitor results.
 - Allow scheduled and recovery digest auto-publish to proceed when the only monitor error is `kaggle result marked as partial`.
 - Keep hard failures publish-blocking.
+- Split the dense multi-announce Kaggle path into a thinner `trail_scout.screen.v1` plus `trail_scout.block_router.v1`, so schedule-card posts like `vkaliningrade/4661` stop forcing the screen stage to solve too many decisions in one structured-output call.
+- Shrink multi-block extract schema and make `route_weaver.enrich.v1` conditional, so a 3-block schedule card no longer automatically expands into the previous heavy `screen + 3 block extracts + 3 enrich` pattern.
 - Add targeted scheduler tests and document the contract in the guide-monitoring README.
 
 ## Follow-up Actions
